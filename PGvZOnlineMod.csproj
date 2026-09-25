@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- 游戏通过 Assembly.LoadFrom 加载 mods/ 顶层 DLL，程序集名必须与文件名一致 -->
+    <AssemblyName>PGvZOnlineMod</AssemblyName>
+    <RootNamespace>PGvZOnlineMod</RootNamespace>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>10.0</LangVersion>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 验证宿主是独立工程，不并入 mod 编译 -->
+    <Compile Remove="VerifyHost\**" />
+    <None Remove="VerifyHost\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 引用游戏自带程序集（Private=false：不复制到输出目录，运行时游戏已加载同名程序集） -->
+    <Reference Include="Lawn">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Lawn.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="IronPython">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\IronPython.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Scripting">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Microsoft.Scripting.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\MonoGame.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.RuntimeDetour">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.RuntimeDetour.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- 传输层：Lawn.dll 本体的依赖（Lawn.deps.json: Lidgren.Network.Core2 1.0.0），随游戏进程已加载 -->
+    <Reference Include="Lidgren.Network">
+      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Lidgren.Network.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

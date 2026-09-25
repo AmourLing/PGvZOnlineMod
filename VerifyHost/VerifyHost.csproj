@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>10.0</LangVersion>
+    <AssemblyName>PGvZOnlineVerify</AssemblyName>
+    <RootNamespace>PGvZOnlineVerify</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 链入 mod 全部源码做离线编译集成（TestDetour 只用 HookInstaller.M，不执行 Install）；
+         Protocol/Net/Core 为 Lawn 无关层，可独立运行时验证 -->
+    <Compile Include="..\src\Core\ModEnv.cs" Link="linked\ModEnv.cs" />
+    <Compile Include="..\src\Core\MainThreadQueue.cs" Link="linked\MainThreadQueue.cs" />
+    <Compile Include="..\src\Core\NetIdRegistry.cs" Link="linked\NetIdRegistry.cs" />
+    <Compile Include="..\src\Protocol\Packets.cs" Link="linked\Packets.cs" />
+    <Compile Include="..\src\Net\NetMgr.cs" Link="linked\NetMgr.cs" />
+    <Compile Include="..\src\Hooks\HookInstaller.cs" Link="linked\HookInstaller.cs" />
+    <Compile Include="..\src\Hooks\GameHooks.cs" Link="linked\GameHooks.cs" />
+    <Compile Include="..\src\Sync\Session.cs" Link="linked\Session.cs" />
+    <Compile Include="..\src\Sync\InputExecutor.cs" Link="linked\InputExecutor.cs" />
+    <Compile Include="..\src\Ui\OnlineLobbyScreen.cs" Link="linked\OnlineLobbyScreen.cs" />
+    <Compile Include="..\src\Ui\Hud.cs" Link="linked\Hud.cs" />
+    <Compile Include="..\src\Ui\IpInputWidget.cs" Link="linked\IpInputWidget.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Lawn">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Lawn.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="MonoGame.Framework">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\MonoGame.Framework.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Newtonsoft.Json.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Lidgren.Network">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Lidgren.Network.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <!-- 离线 detour 验证：与游戏同源的 MonoMod 栈（detour 必须跑在 net6.0 宿主） -->
+    <Reference Include="MonoMod.RuntimeDetour">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.RuntimeDetour.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="MonoMod.Utils">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.Utils.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Mono.Cecil">
+      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Mono.Cecil.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <!-- MonoMod/Cecil 运行时依赖链全量复制（同 植物娘AI对话 VerifyHost 实测配置） -->
+    <None Include="..\..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
+    <None Include="..\..\..\PlantGirlsVsZombies\LawnDLL\Mono.Cecil*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>
