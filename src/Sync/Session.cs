@@ -1992,6 +1992,15 @@ namespace PGvZOnlineMod.Sync
             }
         }
 
+        /// <summary>某槽位的房间准备状态（主机恒视为已准备）。</summary>
+        public static bool RoomReadyOf(int slot)
+        {
+            return slot == 0 || (slot >= 0 && slot < MaxPlayers && _roomReady[slot]);
+        }
+
+        /// <summary>本机（客户端视角）的房间准备状态。</summary>
+        public static bool AmRoomReady => RoomReadyOf(IsHost ? 0 : MySlot);
+
         /// <summary>主机是否可以开局（至少一名客人且全部准备）。</summary>
         public static bool CanStartGame()
         {

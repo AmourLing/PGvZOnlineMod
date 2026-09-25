@@ -22,6 +22,8 @@ namespace PGvZOnlineMod.Ui
         private const int StartId = 113;
         private const int DisconnectId = 114;
         private const int SaveNickId = 115;
+        private const int ReadyBtnId = 116;
+        private const int KickBtnIdBase = 125;
         private const int RoomButtonIdBase = 120;
         private const int RoomButtonCount = 4;
 
@@ -40,6 +42,8 @@ namespace PGvZOnlineMod.Ui
         private IpInputWidget _portEdit;
         private IpInputWidget _nickEdit;
         private NewLawnButton _saveNickBtn;
+        private NewLawnButton _readyBtn;
+        private readonly NewLawnButton[] _kickBtns = new NewLawnButton[Sync.Session.MaxPlayers];
         private NewLawnButton[] _roomButtons = new NewLawnButton[4];
         private long _roomListVersion = -1;
         private bool _roomPhase;
@@ -180,6 +184,16 @@ namespace PGvZOnlineMod.Ui
             _saveNickBtn = MakeButton(SaveNickId, "保存昵称");
             _saveNickBtn.Resize(495, 50, 110, 40);
 
+            _readyBtn = MakeButton(ReadyBtnId, "准备");
+            _readyBtn.Resize(165, 250, 380, 40);
+            _readyBtn.mVisible = false;
+            for (int i = 0; i < Sync.Session.MaxPlayers; i++)
+            {
+                _kickBtns[i] = MakeButton(KickBtnIdBase + i, "踢出");
+                _kickBtns[i].Resize(665, 104 + i * 44, 80, 32);
+                _kickBtns[i].mVisible = false;
+            }
+
             // 局域网房间列表（主路径）：4 个固定槽位按钮，按发现结果填充
             for (int i = 0; i < _roomButtons.Length; i++)
             {
@@ -236,9 +250,20 @@ namespace PGvZOnlineMod.Ui
             _portEdit.mVisible = !room;
             _nickEdit.mVisible = !room;
             _saveNickBtn.mVisible = !room;
-            _levelBtn.mVisible = room;
-            _startBtn.mVisible = room;
+            _levelBtn.mVisible = room && Sync.Session.IsHost;
+            _startBtn.mVisible = room && Sync.Session.IsHost;
+            _readyBtn.mVisible = room && !Sync.Session.IsHost;
             _disconnectBtn.mVisible = room;
+            for (int i = 0; i < Sync.Session.MaxPlayers; i++)
+            {
+                int guestSlot = i + 1;
+                _kickBtns[i].mVisible = room && Sync.Session.IsHost && guestSlot < Sync.Session.MaxPlayers
+                    && Sync.Session.SlotOccupied[guestSlot];
+            }
+            if (room && !Sync.Session.IsHost)
+            {
+                _readyBtn.mLabel = Sync.Session.AmRoomReady ? "取消准备" : "准备";
+            }
             RefreshRoomRows();
             if (room)
             {
@@ -333,23 +358,28 @@ namespace PGvZOnlineMod.Ui
                     TodCommon.TodDrawString(g, "对方一直搜不到本机？Windows 防火墙允许『专用网络+公用网络』，或把热点网络设为专用",
                         500, 205, Resources.FONT_BRIANNETOD16, new SexyColor(255, 200, 120), DrawStringJustification.Center);
                 }
-                // 多人：列出所有已占用槽位的玩家昵称
-                int rowY = 56;
+                // 玩家列表（4 行，44px 行距，含准备状态）
+                int rowY = 60;
                 for (int ps = 0; ps < Sync.Session.MaxPlayers; ps++)
                 {
-                    if (!Sync.Session.SlotOccupied[ps] && ps != 0)
-                    {
-                        continue;
-                    }
-                    string nick = Sync.Session.Nicks[ps];
+                    bool occupied = ps == 0 || Sync.Session.SlotOccupied[ps];
                     string tag = ps == 0 ? "主机" : "客人" + ps;
-                    TodCommon.TodDrawString(g, tag + ": " + (string.IsNullOrEmpty(nick) ? "（等待加入）" : nick),
-                        340, rowY, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220), DrawStringJustification.Right);
-                    rowY += 12;
+                    string nick = Sync.Session.Nicks[ps];
+                    string who = tag + ": " + (occupied && !string.IsNullOrEmpty(nick) ? nick : "（等待加入）");
+                    string state = "";
+                    if (occupied && ps != 0)
+                    {
+                        state = Sync.Session.RoomReadyOf(ps) ? "  ✓已准备" : "  （未准备）";
+                    }
+                    g.SetColor(new SexyColor(90, 90, 90, 120));
+                    g.FillRect(160, rowY - 4, 480, 34);
+                    TodCommon.TodDrawString(g, who + state, 172, rowY + 6, Resources.FONT_BRIANNETOD16,
+                        new SexyColor(240, 240, 240), DrawStringJustification.Left);
+                    rowY += 44;
                 }
                 if (!connected)
                 {
-                    TodCommon.TodDrawString(g, "未连接", 500, 200, Resources.FONT_BRIANNETOD16,
+                    TodCommon.TodDrawString(g, "未连接", 500, 240, Resources.FONT_BRIANNETOD16,
                         new SexyColor(255, 120, 100), DrawStringJustification.Center);
                 }
             }
@@ -450,8 +480,20 @@ namespace PGvZOnlineMod.Ui
                     Sync.Session.CancelOrDisconnect();
                     RefreshUi();
                     break;
+                case ReadyBtnId:
+                    Sync.Session.SetRoomReady(!Sync.Session.AmRoomReady);
+                    RefreshUi();
+                    break;
                 default:
-                    if (theId >= RoomButtonIdBase && theId < RoomButtonIdBase + RoomButtonCount)
+                    if (theId >= KickBtnIdBase && theId < KickBtnIdBase + 3)
+                    {
+                        int kickSlot = theId - KickBtnIdBase + 1;
+                        if (kickSlot < Sync.Session.MaxPlayers && Sync.Session.SlotOccupied[kickSlot])
+                        {
+                            Sync.Session.KickGuest(kickSlot);
+                        }
+                    }
+                    else if (theId >= RoomButtonIdBase && theId < RoomButtonIdBase + RoomButtonCount)
                     {
                         int idx = theId - RoomButtonIdBase;
                         if (idx < Sync.Session.RoomList.Count)
@@ -508,6 +550,14 @@ namespace PGvZOnlineMod.Ui
             RemoveWidget(_portEdit);
             RemoveWidget(_nickEdit);
             RemoveWidget(_saveNickBtn);
+            RemoveWidget(_readyBtn);
+            for (int i = 0; i < _kickBtns.Length; i++)
+            {
+                if (_kickBtns[i] != null)
+                {
+                    RemoveWidget(_kickBtns[i]);
+                }
+            }
             base.RemovedFromManager(manager);
         }
     }
