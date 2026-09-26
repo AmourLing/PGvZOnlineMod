@@ -139,38 +139,49 @@ namespace PGvZOnlineVerify
                     }
                 }
             }
-            // 核心不变量：开放表 = 生存族 ∪ 输入模型兼容的小游戏白名单。
-            // 出怪已由总闸接管（Challenge.UpdateZombieSpawning 在客户端整体跳过），
-            // 种植除卡槽外还认"手里捡来的种子包"（InputPlantCoin），于是天降种子进来了；
-            // 剩下的拒绝理由：宝石迷阵（棋盘就是植物层）、敲僵尸、砸罐子、我是僵尸、禅境，
-            // 以及老虎机——它的过关判定读本地阳光，而阳光各人独立，见 Session.OnlineMiniGames。
-            var allowedExtra = new HashSet<GameMode>
+            // 核心不变量（排除名单式开放）：游戏自己的 gChallengeDefs 是全集，模组只点名排除，
+            // 所以这里要锁三件事——开出来的每条都不在名单里、表里每条都被这两种状态之一覆盖、
+            // 以及几条"必须不在"的正面钉法（名单实现写错时这条会独立报警）。
+            var present = new HashSet<GameMode>();
+            var openModes = new HashSet<GameMode>();
+            bool onlyUnblocked = true;
+            foreach (var lv in levels)
             {
-                GameMode.ChallengeWarAndPeas, GameMode.ChallengeWallnutBowling,
-                GameMode.ChallengeFinalBoss, GameMode.ChallengeFinalBoss2,
-                GameMode.ChallengeRainingSeeds,
-            };
+                present.Add(lv.Mode);
+                openModes.Add(lv.Mode);
+                if (PGvZOnlineMod.Sync.Session.IsBlockedMode(lv.Mode))
+                {
+                    onlyUnblocked = false;
+                    Console.WriteLine("  排除名单里却开放了: " + lv.Mode);
+                }
+            }
+            bool covered = true;
+            int blockedInTable = 0;
+            foreach (var def in ChallengeScreen.gChallengeDefs)
+            {
+                if (def == null || openModes.Contains(def.mChallengeMode))
+                {
+                    continue;
+                }
+                if (!PGvZOnlineMod.Sync.Session.IsBlockedMode(def.mChallengeMode))
+                {
+                    covered = false;
+                    Console.WriteLine("  既没开放也不在名单里（判据缺失）: "
+                        + (int)def.mChallengeMode + " " + def.mChallengeMode);
+                }
+                else
+                {
+                    blockedInTable++;
+                }
+            }
             var mustBeAbsent = new[]
             {
                 GameMode.ChallengeSlotMachine, GameMode.ChallengeBeghouled,
                 GameMode.ChallengeWhackAZombie, GameMode.ScaryPotter1,
                 GameMode.PuzzleIZombie1, GameMode.ChallengeZenGarden,
+                GameMode.ChallengeIce, GameMode.ChallengePortalCombat,
             };
-            bool whitelistOnly = true, absentOk = true;
-            var present = new HashSet<GameMode>();
-            foreach (var lv in levels)
-            {
-                int m = (int)lv.Mode;
-                bool survival = (m >= (int)GameMode.SurvivalNormalStage1 && m <= (int)GameMode.SurvivalEndlessStage5)
-                    || (m >= (int)GameMode.SurvivalHellStage1 && m <= (int)GameMode.SurvivalHellStage5)
-                    || (m >= (int)GameMode.BigPoolSurvivalNormalStage && m <= (int)GameMode.BigPoolSurvivalHellStage);
-                present.Add(lv.Mode);
-                if (!survival && !allowedExtra.Contains(lv.Mode))
-                {
-                    whitelistOnly = false;
-                    Console.WriteLine("  意外开放: " + lv.Mode + " (" + lv.FullLabel + ")");
-                }
-            }
+            bool absentOk = true;
             foreach (var bad in mustBeAbsent)
             {
                 if (present.Contains(bad))
@@ -179,12 +190,32 @@ namespace PGvZOnlineVerify
                     Console.WriteLine("  不该开放却出现: " + bad);
                 }
             }
-            // 天降种子靠 InputPlantCoin 才能玩：白名单里漏加，上面两条断言都不会红，
-            // 所以这里正面钉一次"这关确实在表里"。
-            bool coinModeOk = present.Contains(GameMode.ChallengeRainingSeeds);
-            Check("关卡表：只开放生存族 + 输入兼容的小游戏白名单", whitelistOnly);
-            Check("关卡表：老虎机/宝石迷阵/敲僵尸/砸罐子/我是僵尸/禅境均未开放", absentOk);
-            Check("关卡表：天降种子已开放（InputPlantCoin 的前提）", coinModeOk);
+            // 正面钉几条"必须在表里"：漏判一条排除理由、或筛表把整族吃掉时，上面几条都不会红。
+            // 31/32/148 里 148 融合是被排除的（手套），拿来当反例；开的是 21/31/32/44/123。
+            var mustBePresent = new[]
+            {
+                GameMode.ChallengeRainingSeeds,   // 19 靠 InputPlantCoin
+                GameMode.ChallengeInvisighoul,    // 21 只有僵尸侧行为
+                GameMode.ChallengeWarAndPeas2,    // 31
+                GameMode.ChallengeWallnutBowling2, // 32
+                GameMode.ChallengeGraveDanger,    // 44 靠墓碑出怪闸
+                GameMode.ExtraChallengeStart,     // 123 额外页第一关
+            };
+            bool presentOk = true;
+            foreach (var want in mustBePresent)
+            {
+                if (!present.Contains(want))
+                {
+                    presentOk = false;
+                    Console.WriteLine("  应该开放却不在表里: " + want);
+                }
+            }
+            Console.WriteLine("  全表 " + ChallengeScreen.gChallengeDefs.Length + " 条 / 开放 "
+                + levels.Length + " 关 / 点名排除 " + blockedInTable + " 条");
+            Check("关卡表：开放集合与排除名单互斥", onlyUnblocked);
+            Check("关卡表：全表每条要么开放、要么被点名排除（无判据盲区）", covered);
+            Check("关卡表：老虎机/宝石迷阵/砸罐子/我是僵尸/敲僵尸/禅境/冰面/传送门均未开放", absentOk);
+            Check("关卡表：天降种子与四类已验证的挑战关确实在表里", presentOk);
             Check("关卡表：生存四族各 5 场景共 20 项齐备", survivalOk);
 
             // 排序：页签 → GameMode 数值。曾经按游戏的行/列排，结果大泳池那几条
@@ -238,6 +269,9 @@ namespace PGvZOnlineVerify
             partitionOk &= PGvZOnlineMod.Sync.Session.LevelIndicesOfPage("全部").Count == levels.Length;
             partitionOk &= PGvZOnlineMod.Sync.Session.ClampLevelIndex(-5) == 0
                 && PGvZOnlineMod.Sync.Session.ClampLevelIndex(99999) == levels.Length - 1;
+            // 分类比页签控件还多的话，多出来的那几类只能从"全部"里翻——开放表一大就会撞上，
+            // 上限取自 UI 自己的常量，不在测试里重抄一遍数字。
+            partitionOk &= filters.Count <= PGvZOnlineMod.Ui.OnlineLobbyScreen.TabCount;
             Check("关卡表：分类分页不重不漏且下标越界兜底", partitionOk,
                 "分类 " + (filters?.Count ?? 0) + " 个 / 覆盖 " + union.Count + "/" + levels.Length);
         }

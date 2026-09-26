@@ -158,48 +158,64 @@ namespace PGvZOnlineMod.Sync
         }
 
         /// <summary>
-        /// 能不能联机打这一关，两条判据都要满足：
-        /// ① 出怪可控——通用波次走 SpawnZombieWave（已钩），模式专用出怪走
-        ///    Challenge.UpdateZombieSpawning（客户端已被总闸整体跳过），
-        ///    所以"特殊出怪"不再是拒绝理由；
-        /// ② 玩家输入只有"种植 / 铲除"——本模组转发三种种植请求：
-        ///    卡槽种植（PlantFromBank）、手里种子包种植（PlantFromUsableCoin）、铲除（Shovel）。
-        ///    敲僵尸（锤子）、砸罐子（开罐）、宝石迷阵（拖拽换牌，它的棋盘就是植物层本身）
-        ///    需要额外的输入转发或与植物同步冲突，暂不开放。
-        /// ③ 过关判定得是共享状态。阳光/卡组各人独立，所以"本地阳光攒够就通关"的
-        ///    18 老虎机不能开——每人会在不同时刻各自通关（详见 OnlineMiniGames 注释）。
+        /// 开放判据（三条都要过）。表的全集是游戏自己的 gChallengeDefs，我们只点名排除，
+        /// 每排除一条都得说得出它撞了下面哪一条（回归反过来验"表里每条要么开放、要么在名单里"）。
+        /// ① 出怪可控：通用波次 SpawnZombieWave、模式专用 Challenge.UpdateZombieSpawning、
+        ///    墓碑/屋顶空降/泳池出水 Board.SpawnZombiesFromGraves——三条造僵尸的入口客户端都已钩住，
+        ///    僵尸只能由主机的 SpawnBatch 创建。
+        /// ② 输入只有三种：卡槽种植、捡来的种子包种植、铲除。锤子/开罐/拖拽换牌没有转发；
+        ///    手套（挪植物）联机中全体禁用——植物的格坐标没有同步通道，主机挪了别人看不见。
+        /// ③ 过关判定必须是共享状态：阳光与卡组各人独立，所以"本地阳光攒够就通关"的不能开。
+        /// 还有一类是"逐帧改世界状态、而那个状态本身不在同步字段里"（冰面按行融化、传送门随机搬位、
+        /// 速度关重入整局更新），得先补批量同步才救得回来，同样先排除。
         /// 冒险模式另说：它是 (GameMode, 关卡号) 二元组，光给 GameMode 起不了关。
         /// </summary>
         private static bool IsOnlinePlayable(ChallengeDefinition def)
         {
-            if (def == null)
-            {
-                return false;
-            }
-            GameMode m = def.mChallengeMode;
-            bool survival = (m >= GameMode.SurvivalNormalStage1 && m <= GameMode.SurvivalEndlessStage5)
-                || (m >= GameMode.SurvivalHellStage1 && m <= GameMode.SurvivalHellStage5)
-                || (m >= GameMode.BigPoolSurvivalNormalStage && m <= GameMode.BigPoolSurvivalHellStage);
-            return survival || OnlineMiniGames.Contains(m);
+            return def != null && !IsBlockedMode(def.mChallengeMode);
         }
 
-        /// <summary>
-        /// MiniGameStart(16)..MiniGameCount(20) 里可联机的子集，外加僵尸博士两关。
-        /// 19 天降种子的免费种子包走 InputPlantCoin 转发（同一条路也接得住罐子掉出来的包）。
-        /// 两关仍开不了，理由各不相同：
-        /// · 18 老虎机——过关判定是"本地阳光攒满 2000"，而阳光按设计各人独立，
-        ///   于是每人会在不同时刻各自通关；要开得先给这关定一条共享目标，游戏自己没有。
-        /// · 20 宝石迷阵——棋盘就是 mBoard.mPlants 本身，每格宝石都是植物，
-        ///   与"植物层由主机权威广播"直接冲突，要单独做宝石网格同步。
-        /// </summary>
-        private static readonly HashSet<GameMode> OnlineMiniGames = new HashSet<GameMode>
+        /// <summary>排除名单（public 是给离线回归当权威源用，不要在别处调）。</summary>
+        public static bool IsBlockedMode(GameMode m)
         {
-            GameMode.ChallengeWarAndPeas,      // 16 豌豆大战僵尸：纯种植守家
-            GameMode.ChallengeWallnutBowling,  // 17 坚果保龄球：点赛道走的就是种植光标
-            GameMode.ChallengeRainingSeeds,    // 19 天降种子：种子雨由主机排期，各人接自己那份
-            GameMode.ChallengeFinalBoss,       // 34 僵尸博士：普通种植，Boss 造僵尸归出怪总闸管
-            GameMode.ChallengeFinalBoss2,      // 131 僵尸博士的复仇2：同上，种子雨同样走同步排期
-        };
+            switch (m)
+            {
+            // ② 输入没转发：29 锤子敲僵尸、48 点松鼠；
+            //    20/23 宝石迷阵两关另有一层——它的棋盘就是 mBoard.mPlants 本身，
+            //    每格宝石都是植物，与"植物层由主机权威广播"正面冲突。
+            case GameMode.ChallengeWhackAZombie:
+            case GameMode.ChallengeSquirrel:
+            case GameMode.ChallengeBeghouled:
+            case GameMode.ChallengeBeghouledTwist:
+            // ③ 18 老虎机的通关判定是"本地阳光攒满 2000"，阳光各人独立 → 每人各自时刻通关。
+            case GameMode.ChallengeSlotMachine:
+            // ② 的延伸：手套被整体禁用，而这些关把手套当主要操作手，禁了等于缺一根手指。
+            case GameMode.ImitaterRandom:
+            case GameMode.ChallengeFusion:
+            case GameMode.ChallengeStageRandom:
+            case GameMode.RogueConveyorbelt:
+            case GameMode.RogueConveyorbeltHard:
+            // 逐帧改世界状态、而该状态不同步：41 冰面按行融化（mIceTimer[]）、
+            // 25 传送门位置本地随机搬、28 速度关在 Challenge.Update 里重入 Board.UpdateGame、
+            // 30 最后一战有自己的阶段状态机 + 中途重选卡。
+            case GameMode.ChallengeIce:
+            case GameMode.ChallengePortalCombat:
+            case GameMode.ChallengeSpeed:
+            case GameMode.ChallengeLastStand:
+            // 不是"操控植物守家"，或根本不是关卡：42 禅境花园、49 智慧树、122 僵尸水族馆、
+            // 70 推销页、71 开场。
+            case GameMode.ChallengeZenGarden:
+            case GameMode.TreeOfWisdom:
+            case GameMode.ChallengeZombiquarium:
+            case GameMode.Upsell:
+            case GameMode.Intro:
+                return true;
+            }
+            // 50..59 砸罐子：开罐是独立输入，罐子里是随机的（僵尸/种子/阳光）必须先做主机裁决；
+            // 60..69 我是僵尸：玩家操控的是僵尸，本模组的种植/铲子入口在那边根本不存在。
+            return (m >= GameMode.ScaryPotter1 && m <= GameMode.ScaryPotterEndless)
+                || (m >= GameMode.PuzzleIZombie1 && m <= GameMode.PuzzleIZombieEndless);
+        }
 
         private static OnlineLevel[] BuildLevels()
         {
@@ -352,11 +368,7 @@ namespace PGvZOnlineMod.Sync
             {
                 return "天降种子：照常用卡组守关，天上不断掉免费种子包，各人接各人的那份";
             }
-            if (OnlineMiniGames.Contains(mode))
-            {
-                return "小游戏/Boss：出怪与僵尸全由主机驱动，种植与铲除同步";
-            }
-            return "目标与单人打这一关一致：过关即整局胜利";
+            return "目标与单人打这一关一致：出怪全由主机驱动，打完全部波次即整局胜利";
         }
 
         /// <summary>

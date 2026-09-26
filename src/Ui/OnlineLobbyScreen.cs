@@ -38,7 +38,7 @@ namespace PGvZOnlineMod.Ui
         private const int LvlRowIdBase = 160;  // 下拉的关卡条目行
         private const int LvlPrevId = 170;
         private const int LvlNextId = 171;
-        private const int TabCount = 6;        // 全部 + 五个页签
+        internal const int TabCount = 6;       // 全部 + 五个页签（离线回归会拿它当分类数的上限校验）
         private const int RowCount = 4;        // 下拉每页显示几关
 
         private enum HitKind { Info, Seat, RoomRow, Kick, Tab, LevelRow, Pager }
@@ -425,6 +425,29 @@ namespace PGvZOnlineMod.Ui
             }
         }
 
+        /// <summary>
+        /// 展开下拉时先定位到"当前选定关卡"所在的分类与页：表已经有 60 来关，
+        /// 每次都从第 1 页开始翻，换个关要点七八下。
+        /// </summary>
+        private void JumpToSelectedLevel()
+        {
+            _dropFilters ??= Sync.Session.LevelPageFilters();
+            int sel = Sync.Session.ClampLevelIndex(Sync.Session.SelectedLevelIndex);
+            for (int f = 1; f < _dropFilters.Count; f++)
+            {
+                int pos = Sync.Session.LevelIndicesOfPage(_dropFilters[f]).IndexOf(sel);
+                if (pos >= 0)
+                {
+                    _dropFilter = f;
+                    _dropPage = pos / RowCount;
+                    return;
+                }
+            }
+            _dropFilter = 0;
+            int inAll = Sync.Session.LevelIndicesOfPage(_dropFilters[0]).IndexOf(sel);
+            _dropPage = inAll >= 0 ? inAll / RowCount : 0;
+        }
+
         /// <summary>选关下拉：分类 tab + 关卡条目 + 翻页。全部自绘，不依赖按钮控件。</summary>
         private void BuildDropdownHits()
         {
@@ -766,7 +789,10 @@ namespace PGvZOnlineMod.Ui
                     SaveNick();
                     break;
                 case LevelId:
-                    _dropPage = 0;
+                    if (!_dropOpen)
+                    {
+                        JumpToSelectedLevel();
+                    }
                     _dropOpen = !_dropOpen;
                     break;
                 case StartId:

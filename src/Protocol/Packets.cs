@@ -9,10 +9,13 @@ namespace PGvZOnlineMod.Protocol
     /// v12 = 生成清单带血量上限；v13 = 关卡表 5→20；v14 = 关卡表改取游戏的 gChallengeDefs；
     /// v15 = PauseRequest 载荷加槽位（主机的暂停要能广播给客人）+ 新增 SeedState 位图。
     /// v16 = 天降种子包同步 + 「手里种子包种下去」的输入转发（19 天降种子）。
+    /// v17 = 没加消息，但"谁在造僵尸"变了：客户端把墓碑起僵尸/屋顶空降/泳池出水一并锁进总闸，
+    ///       传送带关卡的卡改按种子类型转发。老 v16 客户端仍会在本地凭空造僵尸，
+    ///       与新端配对必不同步——语义不兼容就得升号。
     /// </summary>
     public static class ProtocolVersion
     {
-        public const int Current = 16;
+        public const int Current = 17;
     }
 
     /// <summary>模组标识哈希：进握手包，两端必须一致（防不同版本逻辑不同步）。</summary>
@@ -69,7 +72,7 @@ namespace PGvZOnlineMod.Protocol
         SeedState = 27,
         /// <summary>Host 天降了一枚可用种子包（载荷=落点x/种子类型/新模式倒计时），客户端同位置掉自己的一份</summary>
         RainSeedPacket = 28,
-        /// <summary>客户端把手里捡到的种子包种下去（载荷=槽位/种子类型/变异类型/格坐标）</summary>
+        /// <summary>客户端把手里捡的种子包 / 传送带上的卡种下去（载荷=槽位/种子类型/变异类型/格坐标）</summary>
         InputPlantCoin = 29,
     }
 
@@ -459,6 +462,7 @@ namespace PGvZOnlineMod.Protocol
         /// 手里种子包（CursorType.PlantFromUsableCoin）的种植请求。
         /// 与 InputPlant 的区别：这里没有卡槽，携带的是种子类型本身——种子包不属于任何人的卡组，
         /// 它是天上掉下来的公共事件，落地后归各自所有，只有"种下去"这个动作要主机裁决。
+        /// 传送带关的卡也走这条：带子上的卡同样"第几格"没有身份含义，两端的带子各走各的。
         /// </summary>
         public static void WriteInputPlantCoin(NetOutgoingMessage m, int playerSlot, int seedType, int imitaterType, int gridX, int gridY)
         {

@@ -62,6 +62,17 @@ namespace PGvZOnlineMod.Hooks
             HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "UpdateZombieSpawning", Type.EmptyTypes),
                 (Func<Func<Challenge, bool>, Challenge, bool>)ChallengeUpdateZombieSpawningHook);
 
+            // 出怪总闸的第二条腿：墓碑起僵尸（并顺带屋顶空降 / 泳池出水）既不走 SpawnZombieWave
+            // 也不走 UpdateZombieSpawning，用的是本棋盘自己的随机数选类型与行——以前客户端在这里
+            // 会自己冒出一堆主机没有的僵尸（黑夜/浓雾/屋顶/泳池关早就在漏）。
+            HookEndpointManager.Add(HookInstaller.M(typeof(Board), "SpawnZombiesFromGraves", Type.EmptyTypes),
+                (Action<Action<Board>, Board>)BoardSpawnZombiesFromGravesHook);
+
+            // 手套（把植物拔起来挪个格子）：植物的格坐标没有同步通道，主机挪了别人看不见，
+            // 所以联机中两端一律不给拿起来——要换位只能用铲子重新种。
+            HookEndpointManager.Add(HookInstaller.M(typeof(Board), "PickUpTool", new[] { typeof(GameObjectType) }),
+                (Action<Action<Board, GameObjectType>, Board, GameObjectType>)BoardPickUpToolHook);
+
             // 天降种子雨：Client 抑制本地随机掉落，Host 掉出种子包后广播（落点/卡种/下轮排期）。
             // 19 天降种子的主循环，也是 131 僵尸博士2 的种子雨来源。
             HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "UpdateRainingSeeds", Type.EmptyTypes),
@@ -120,7 +131,7 @@ namespace PGvZOnlineMod.Hooks
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "AddPlant", new[] { typeof(int), typeof(int), typeof(SeedType), typeof(SeedType) }),
                 (Func<Func<Board, int, int, SeedType, SeedType, Plant>, Board, int, int, SeedType, SeedType, Plant>)BoardAddPlantHook);
 
-            ModEnv.Log("联机 Hooks 已注册（22 个，逐个清单见 项目文档.md 第 6 节；" +
+            ModEnv.Log("联机 Hooks 已注册（24 个，逐个清单见 项目文档.md 第 6 节；" +
                        "核心：LawnApp.UpdateFrames 主泵 / CutScene.EndSeedChooser 门闩 / " +
                        "Board.Update·Draw / SpawnZombieWave×2 / MouseUpWithPlant / MouseDownWithTool）");
         }
@@ -321,6 +332,36 @@ namespace PGvZOnlineMod.Hooks
         // ------------------------------------------------------------ 种植转发（Client）/ 远端执行（Host）
 
         /// <summary>
+        /// 墓碑起僵尸（内部还会走屋顶空降 / 泳池出水）用的是本棋盘自己的随机数——类型随机、行随机，
+        /// 客户端在这里会凭空冒出一堆主机没见过的僵尸，反过来啃自己那份植物。同步中一律不执行。
+        /// </summary>
+        private static void BoardSpawnZombiesFromGravesHook(Action<Board> orig, Board self)
+        {
+            if (Session.ClientSuppressionActive)
+            {
+                return;
+            }
+            orig(self);
+        }
+
+        /// <summary>
+        /// 联机中谁都不许拿起手套：植物被挪到新格子这件事没有同步通道（快照只补"多出来"和"消失"
+        /// 的植物，位置变了看不出来），任一方挪一次就让两块草坪对不上。要换位请用铲子。
+        /// 只在联机同步中拦，断线回退单机后手套照旧。
+        /// </summary>
+        private static void BoardPickUpToolHook(Action<Board, GameObjectType> orig, Board self, GameObjectType theObjectType)
+        {
+            if (theObjectType == GameObjectType.Glove && Session.SyncActive)
+            {
+                Session.LastChat = "联机中不能挪植物：要换位请用铲子铲掉再种";
+                Session.LastChatAge = 0;
+                ModEnv.LogOnce("[手套] 联机中已禁用（重复点击不再记）");
+                return;
+            }
+            orig(self, theObjectType);
+        }
+
+        /// <summary>
         /// 种子雨的落点与卡种都是本地随机的，不锁就每人接到的包各不相同，
         /// 后面"谁种下了什么"根本无法对齐。客户端整段跳过（自己那份由主机事件掉出来），
         /// 主机掉完后把落点/卡种/下一轮排期广播出去。
@@ -425,6 +466,27 @@ namespace PGvZOnlineMod.Hooks
                 var ownPacket = self.mSeedBank != null && slot >= 0 && slot < self.mSeedBank.mNumPackets
                     ? self.mSeedBank.mSeedPackets[slot]
                     : null;
+                if (self.HasConveyorBeltSeedBank() && ownPacket != null)
+                {
+                    // 传送带关：卡是带子上随到随用的，"第几个卡槽"没有身份含义——两端的带子各走各的、
+                    // 长度天然不同，让主机按客人的下标去动自己的卡槽必然串位甚至越界。
+                    // 所以这里报"种子类型"，借已经验证过的免扣费通道（InputPlantCoin）落地。
+                    int beltType = (int)ownPacket.mPacketType;
+                    int beltImit = (int)ownPacket.mImitaterType;
+                    if (gx >= 0 && gy >= 0)
+                    {
+                        Session.SendPlantCoinRequest(Session.MySlot, beltType, beltImit, gx, gy);
+                        try
+                        {
+                            ownPacket.WasPlanted(); // 带子关的 WasPlanted = 从自己这条带上摘掉
+                        }
+                        catch
+                        {
+                        }
+                        Core.ModEnv.Log("[种植] 客户端请求带子卡 类型=" + beltType + " 格=" + gx + "," + gy);
+                    }
+                    return;
+                }
                 if (ownPacket != null && ownPacket.mRefreshing)
                 {
                     return; // 冷却中（兜底：正常情况下选卡环节就会拦住）
