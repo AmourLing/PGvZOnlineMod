@@ -20,6 +20,7 @@ MOD_DLL = os.path.join(ROOT, "bin", "Release", "net6.0", "PGvZOnlineMod.dll")
 README = os.path.join(ROOT, "使用说明.txt")
 TEMPLATE = os.path.join(ROOT, "使用说明模板.txt")
 CONFIG_SRC = os.path.join(ROOT, "配置模板", "联机配置.json")
+NOTICES = os.path.join(ROOT, "THIRD-PARTY-NOTICES.md")
 GAME_DLL_DIR = os.path.join(ROOT, "..", "..", "PlantGirlsVsZombies", "LawnDLL")
 LIDGRE_DLL = os.path.join(GAME_DLL_DIR, "Lidgren.Network.Core.dll")
 NEWTONSOFT_DLL = os.path.join(GAME_DLL_DIR, "Newtonsoft.Json.dll")
@@ -84,6 +85,10 @@ def main():
     if not os.path.exists(CONFIG_SRC):
         print("## 缺少 %s，中止" % CONFIG_SRC)
         return 1
+    # 再分发第三方 DLL 就必须把它们的声明一起发出去：缺这份宁可不打包，也别发不合规的包
+    if not os.path.exists(NOTICES):
+        print("## 缺少 %s，中止（发布包要带第三方许可声明）" % NOTICES)
+        return 1
     for dep, name in ((LIDGRE_DLL, "Lidgren.Network.Core.dll"), (NEWTONSOFT_DLL, "Newtonsoft.Json.dll")):
         if not os.path.exists(dep):
             print("## 缺少依赖 %s，中止" % dep)
@@ -99,6 +104,8 @@ def main():
         z.write(CONFIG_SRC, "PGvZOnlineMod/联机配置.json")
         z.write(LIDGRE_DLL, "PGvZOnlineMod/Lidgren.Network.Core.dll")
         z.write(NEWTONSOFT_DLL, "PGvZOnlineMod/Newtonsoft.Json.dll")
+        # 声明挨着那两个 DLL 放（它们才是这份声明描述的对象），mods\ 顶层不留杂物
+        z.write(NOTICES, "PGvZOnlineMod/THIRD-PARTY-NOTICES.md")
         z.write(README, "使用说明.txt")
     print("## 打包完成: %s (%d bytes)" % (zip_path, os.path.getsize(zip_path)))
     return 0

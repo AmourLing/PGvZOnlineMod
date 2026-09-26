@@ -32,6 +32,7 @@
        mods\PGvZOnlineMod\联机配置.json
        mods\PGvZOnlineMod\Lidgren.Network.Core.dll
        mods\PGvZOnlineMod\Newtonsoft.Json.dll
+       mods\PGvZOnlineMod\THIRD-PARTY-NOTICES.md（随包分发的两个库的许可声明）
        mods\使用说明.txt（可选）
    - Windows：%AppData%\ZBC\PlantGirlsVsZombies\mods
    - Android：/storage/emulated/0/Android/data/net.pvz.pgvz.zbcteam/files/mods
