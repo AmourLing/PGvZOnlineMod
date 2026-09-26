@@ -56,6 +56,12 @@ namespace PGvZOnlineMod.Hooks
             HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "SpawnZombieWave", Type.EmptyTypes),
                 (Action<Action<Challenge>, Challenge>)ChallengeSpawnZombieWaveHook);
 
+            // 出怪总闸（客户端）：小游戏/僵尸博士/砸罐子这些模式由 Challenge.UpdateZombieSpawning
+            // 自己造僵尸，绕开 SpawnZombieWave。客户端一律判定"已处理"，于是本地一只僵尸都不会自己冒出来，
+            // 僵尸只能由主机的 SpawnBatch 事件创建 —— 这是能开放更多模式的前提。
+            HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "UpdateZombieSpawning", Type.EmptyTypes),
+                (Func<Func<Challenge, bool>, Challenge, bool>)ChallengeUpdateZombieSpawningHook);
+
             // 种植：Client 转请求；Host 执行远端输入时直接走 orig
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "MouseUpWithPlant", new[] { typeof(int), typeof(int), typeof(int) }),
                 (Action<Action<Board, int, int, int>, Board, int, int, int>)BoardMouseUpWithPlantHook);
@@ -94,14 +100,24 @@ namespace PGvZOnlineMod.Hooks
 
 
 
+            // 局内聊天入口：Enter 打开聊天框（棋盘是键盘焦点时才会走到这里）
+            HookEndpointManager.Add(HookInstaller.M(typeof(Board), "KeyDown", new[] { typeof(KeyCode) }),
+                (Action<Action<Board, KeyCode>, Board, KeyCode>)BoardKeyDownHook);
+
+            // 联机局不写单人进度：生存关结算会把"最高旗帜纪录"写进存档并顺带推进解锁，
+            // 多人合力刷纪录不该进单人档案（钩这一处即可，纪录的唯一持久化点在此）
+            HookEndpointManager.Add(HookInstaller.M(typeof(Board), "SurvivalSaveScore", Type.EmptyTypes),
+                (Action<Action<Board>, Board>)BoardSurvivalSaveScoreHook);
+
             // 同步创建的实体登记 netId（仅 Client 应用 SpawnBatch 时触发）
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "AddZombieInRow", new[] { typeof(ZombieType), typeof(int), typeof(int), typeof(bool) }),
                 (Func<Func<Board, ZombieType, int, int, bool, Zombie>, Board, ZombieType, int, int, bool, Zombie>)BoardAddZombieInRowHook);
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "AddPlant", new[] { typeof(int), typeof(int), typeof(SeedType), typeof(SeedType) }),
                 (Func<Func<Board, int, int, SeedType, SeedType, Plant>, Board, int, int, SeedType, SeedType, Plant>)BoardAddPlantHook);
 
-            ModEnv.Log("联机 Hooks 已注册（UpdateFrames/ButtonDepress/Board.Update/Board.Draw/" +
-                       "SpawnZombieWave×2/MouseUpWithPlant/Coin.MouseDown/AddZombieInRow/AddPlant）");
+            ModEnv.Log("联机 Hooks 已注册（21 个，逐个清单见 项目文档.md 第 6 节；" +
+                       "核心：LawnApp.UpdateFrames 主泵 / CutScene.EndSeedChooser 门闩 / " +
+                       "Board.Update·Draw / SpawnZombieWave×2 / MouseUpWithPlant / MouseDownWithTool）");
         }
 
         // ------------------------------------------------------------ 主泵
@@ -229,22 +245,26 @@ namespace PGvZOnlineMod.Hooks
             orig(self, g);
             try
             {
+                // 按人列出选卡进度（含自己）：谁在选、谁选完了，一眼看清
                 if (Session.ReadyGateActive && !Session.LevelActuallyStarted)
                 {
-                    var font = Resources.FONT_DWARVENTODCRAFT15;
-                    if (Session.AwaitingReady)
+                    var font = Resources.FONT_BRIANNETOD16;
+                    g.SetFont(font);
+                    int y = 36;
+                    for (int s = 0; s < Session.MaxPlayers; s++)
                     {
-                        const string waiting = "等待另一位玩家完成选卡…";
-                        g.SetFont(font);
-                        g.SetColor(new SexyColor(255, 235, 120, 240));
-                        g.DrawString(waiting, (self.mWidth - font.StringWidth(waiting)) / 2, 40);
-                    }
-                    else if (Session.AllReadyNow)
-                    {
-                        const string ready = "对方已完成选卡";
-                        g.SetFont(Resources.FONT_BRIANNETOD16);
-                        g.SetColor(new SexyColor(160, 255, 160, 220));
-                        g.DrawString(ready, (self.mWidth - Resources.FONT_BRIANNETOD16.StringWidth(ready)) / 2, 46);
+                        if (s != 0 && !Session.SlotOccupied[s])
+                        {
+                            continue; // 空位不占行
+                        }
+                        bool done = Session.SeedReadyOf(s);
+                        string nick = Session.Nicks[s];
+                        string line = (string.IsNullOrEmpty(nick) ? "P" + (s + 1) : nick)
+                            + (s == Session.MySlot ? "（你）" : "")
+                            + (done ? "（选卡完成）" : "（选卡中）");
+                        g.SetColor(done ? new SexyColor(170, 245, 170, 235) : new SexyColor(255, 225, 150, 235));
+                        g.DrawString(line, (self.mWidth - font.StringWidth(line)) / 2, y);
+                        y += 18;
                     }
                 }
             }
@@ -277,6 +297,20 @@ namespace PGvZOnlineMod.Hooks
                 return;
             }
             orig(self);
+        }
+
+        /// <summary>
+        /// 返回 true = "本模式自己处理了出怪"，Board 因此不再走通用波次追赶循环；
+        /// 客户端要的就是这个效果——它不该造任何僵尸（主机下发的走 ApplySpawnBatch）。
+        /// </summary>
+        private static bool ChallengeUpdateZombieSpawningHook(Func<Challenge, bool> orig, Challenge self)
+        {
+            if (Session.ClientSuppressionActive)
+            {
+                ModEnv.LogOnce("[出怪闸] 客户端跳过模式专用出怪（重复不再记）");
+                return true;
+            }
+            return orig(self);
         }
 
         // ------------------------------------------------------------ 种植转发（Client）/ 远端执行（Host）
@@ -400,6 +434,22 @@ namespace PGvZOnlineMod.Hooks
             }
         }
 
+        // ------------------------------------------------------------ 局内聊天入口（Enter）
+
+        /// <summary>
+        /// 棋盘是对局里的键盘焦点控件，Enter 原本只用于推进僵尸博士对话；
+        /// 联机中改作"打开聊天框"。聊天框打开后自己成为焦点，棋盘收不到键，
+        /// 所以数字选卡/空格暂停/ESC 菜单这些热键天然被屏蔽，无需额外拦键钩子。
+        /// </summary>
+        private static void BoardKeyDownHook(Action<Board, KeyCode> orig, Board self, KeyCode theKey)
+        {
+            if (theKey == KeyCode.Return && Ui.ChatWidget.TryToggleByKeyboard())
+            {
+                return;
+            }
+            orig(self, theKey);
+        }
+
         // ------------------------------------------------------------ 暂停同步
 
         private static void BoardPauseHook(Action<Board, bool> orig, Board self, bool thePause)
@@ -472,6 +522,35 @@ namespace PGvZOnlineMod.Hooks
             }
         }
 
+        // ------------------------------------------------------------ 联机局不刷单人存档
+
+        /// <summary>
+        /// 游戏在生存关结算时把"最高旗帜数"写进 mChallengeRecords 并立即落盘，
+        /// 顺带推进解锁/新内容标记。联机合力打出来的成绩不该进单人档案；
+        /// 断线回退单机后自动恢复原行为。
+        /// 只在生存模式上拦：非生存关这方法本就是空转，无条件 return 会让日志
+        /// 谎报"跳过生存纪录写档"（实机日志里就这样误导过一次）。
+        /// </summary>
+        private static void BoardSurvivalSaveScoreHook(Action<Board> orig, Board self)
+        {
+            bool suppress;
+            try
+            {
+                suppress = Session.SyncActive && self != null && self.mApp != null
+                    && self.mApp.IsSurvivalMode();
+            }
+            catch
+            {
+                suppress = false;
+            }
+            if (!suppress)
+            {
+                orig(self);
+                return;
+            }
+            ModEnv.LogOnce("联机局：跳过生存纪录写档（同类只报一次）");
+        }
+
         // ------------------------------------------------------------ 铲子转发（Client）
 
         /// <summary>
@@ -513,14 +592,22 @@ namespace PGvZOnlineMod.Hooks
             Zombie z = orig(self, theZombieType, theRow, theFromWave, theCover);
             try
             {
-                if (z != null && Session.ApplyingSync && Session.RegisterNextId != 0)
+                if (z != null)
                 {
-                    Session.Registry.Register(Session.RegisterNextId, z);
-                    Session.RegisterNextId = 0;
+                    if (Session.ApplyingSync && Session.RegisterNextId != 0)
+                    {
+                        Session.Registry.Register(Session.RegisterNextId, z);
+                        Session.RegisterNextId = 0;
+                    }
+                    else
+                    {
+                        Session.BoostHostZombie(z, theFromWave); // 仅主机·联机·≥2 人时生效
+                    }
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                ModEnv.LogOnce("僵尸生成钩子异常（重复不再记）: " + ex);
             }
             return z;
         }

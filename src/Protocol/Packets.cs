@@ -4,10 +4,14 @@ using Lidgren.Network;
 
 namespace PGvZOnlineMod.Protocol
 {
-    /// <summary>协议版本：字段布局不兼容时 +1，握手不一致直接拒连。</summary>
+    /// <summary>
+    /// 协议版本：字段布局**或字段语义**不兼容时 +1，握手不一致直接拒连。
+    /// v12 = 生成清单带血量上限；v13 = 关卡表 5→20；v14 = 关卡表改取游戏的 gChallengeDefs；
+    /// v15 = PauseRequest 载荷加槽位（主机的暂停要能广播给客人）+ 新增 SeedState 位图。
+    /// </summary>
     public static class ProtocolVersion
     {
-        public const int Current = 11;
+        public const int Current = 15;
     }
 
     /// <summary>模组标识哈希：进握手包，两端必须一致（防不同版本逻辑不同步）。</summary>
@@ -38,7 +42,11 @@ namespace PGvZOnlineMod.Protocol
         SunProduced = 16,
         /// <summary>Host 天降了一枚阳光（载荷=落点x/类型/新倒计时），客户端同位置同刻掉落</summary>
         SkySun = 17,
-        /// <summary>一方暂停/恢复（载荷=bool），双方棋盘同步冻结/继续</summary>
+        /// <summary>
+        /// 一方暂停/恢复（载荷=槽位 + bool）。
+        /// 槽位必须带上：主机是裁决者，它要把"谁按了暂停"广播给其余人，
+        /// 收端才知道该记在哪一格、能不能解除冻结。
+        /// </summary>
         PauseRequest = 18,
         /// <summary>Host 放置了钉耙（载荷=格子x,y），客户端同位镜像放置</summary>
         RakePlaced = 19,
@@ -56,6 +64,8 @@ namespace PGvZOnlineMod.Protocol
         RoomReadyRequest = 25,
         /// <summary>主机踢人（载荷=原因文本）</summary>
         Kick = 26,
+        /// <summary>各槽位选卡就绪位图（主机 → 全员，选卡界面按人显示状态）</summary>
+        SeedState = 27,
     }
 
     // ------------------------------------------------------------ 数据结构（Lawn 无关，离线可测）
@@ -76,6 +86,11 @@ namespace PGvZOnlineMod.Protocol
         public int ZombieType, Row;
         public float X, Y;
         public int Hp;
+        /// <summary>
+        /// 血量上限：主机按人数加压后与基础值不同，客户端不带上就会错位
+        /// 断头/伤害帧/巨人扔小鬼等一切"按血量比例"的判定。
+        /// </summary>
+        public int MaxHp;
     }
 
     public struct NetZombieState
@@ -332,15 +347,42 @@ namespace PGvZOnlineMod.Protocol
 
         // ---- 暂停同步
 
-        public static void WritePauseRequest(NetOutgoingMessage m, bool paused)
+        public static void WritePauseRequest(NetOutgoingMessage m, int playerSlot, bool paused)
         {
             m.Write((byte)PacketType.PauseRequest);
+            m.Write((byte)playerSlot);
             m.Write(paused);
         }
 
-        public static bool ReadPauseRequest(NetIncomingMessage m)
+        public static void ReadPauseRequest(NetIncomingMessage m, out int playerSlot, out bool paused)
         {
-            return m.ReadBoolean();
+            playerSlot = m.ReadByte();
+            paused = m.ReadBoolean();
+        }
+
+        /// <summary>选卡就绪位图：bit s = 槽位 s 已完成选卡。</summary>
+        public static void WriteSeedState(NetOutgoingMessage m, int readyMask)
+        {
+            m.Write((byte)PacketType.SeedState);
+            m.Write((byte)readyMask);
+        }
+
+        public static int ReadSeedState(NetIncomingMessage m)
+        {
+            return m.ReadByte();
+        }
+
+        public static void WriteRakePlaced(NetOutgoingMessage m, int gridX, int gridY)
+        {
+            m.Write((byte)PacketType.RakePlaced);
+            m.Write(gridX);
+            m.Write(gridY);
+        }
+
+        public static void ReadRakePlaced(NetIncomingMessage m, out int gridX, out int gridY)
+        {
+            gridX = m.ReadInt32();
+            gridY = m.ReadInt32();
         }
 
         // ---- 植物产出事件
@@ -448,6 +490,7 @@ namespace PGvZOnlineMod.Protocol
                     m.Write(z.X);
                     m.Write(z.Y);
                     m.Write(z.Hp);
+                    m.Write(z.MaxHp);
                 }
             }
             m.WriteVariableUInt32((uint)(plants?.Count ?? 0));
@@ -480,6 +523,7 @@ namespace PGvZOnlineMod.Protocol
                     X = m.ReadFloat(),
                     Y = m.ReadFloat(),
                     Hp = m.ReadInt32(),
+                    MaxHp = m.ReadInt32(),
                 });
             }
             uint pc = m.ReadVariableUInt32();

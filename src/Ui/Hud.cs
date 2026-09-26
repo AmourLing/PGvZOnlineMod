@@ -17,8 +17,9 @@ namespace PGvZOnlineMod.Ui
         private static float _cachedRtt = -1f;
         private static bool _cachedConnected;
         private static int _cachedPlayerCount = -1;
+        private static string _cachedStatusLabel = "";
 
-        /// <summary>状态字符串重建（主线程泵低频调用，非绘制路径）。</summary>
+        /// <summary>状态字符串重建（主线程泵每帧调用，非绘制路径）：没变化就不重新拼串。</summary>
         public static void RefreshStatusCache()
         {
             bool connected = Session.Net.IsConnected;
@@ -42,6 +43,8 @@ namespace PGvZOnlineMod.Ui
             _cachedConnected = connected;
             _cachedRtt = rtt;
             _cachedPlayerCount = count;
+            _cachedStatusLabel = "联机中 · " + count + " 人"
+                + (rtt > 0 ? "  " + (int)rtt + "ms" : "");
         }
 
         public static void Draw(Board board, Graphics g)
@@ -82,8 +85,7 @@ namespace PGvZOnlineMod.Ui
             if (Session.Net.IsConnected)
             {
                 g.SetColor(new SexyColor(140, 255, 140, 220));
-                string label = "联机中 · " + _cachedPlayerCount + " 人"
-                    + (_cachedRtt > 0 ? "  " + (int)_cachedRtt + "ms" : "");
+                string label = _cachedStatusLabel;
                 int w = (int)Resources.FONT_BRIANNETOD16.StringWidth(label);
                 g.DrawString(label, board.mWidth - w - 16, 8);
             }

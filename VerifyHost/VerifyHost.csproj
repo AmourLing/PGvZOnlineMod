@@ -25,6 +25,7 @@
     <Compile Include="..\src\Ui\OnlineLobbyScreen.cs" Link="linked\OnlineLobbyScreen.cs" />
     <Compile Include="..\src\Ui\Hud.cs" Link="linked\Hud.cs" />
     <Compile Include="..\src\Ui\IpInputWidget.cs" Link="linked\IpInputWidget.cs" />
+    <Compile Include="..\src\Ui\ChatWidget.cs" Link="linked\ChatWidget.cs" />
   </ItemGroup>
 
   <ItemGroup>

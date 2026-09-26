@@ -20,6 +20,11 @@ namespace PGvZOnlineMod.Core
         public int SnapshotHz = 20;
         /// <summary>远端光标同步频率（Hz）。</summary>
         public int CursorHz = 10;
+        /// <summary>
+        /// 按人数加压：每多一名玩家给僵尸血量追加的比例（0.35 = 三人局僵尸血量 1.7 倍）。
+        /// 0 = 关闭加压。仅主机侧生效（生成时放大，随生成清单下发给各端）。
+        /// </summary>
+        public float ZombieHpPerExtraPlayer = 0.35f;
     }
 
     /// <summary>
@@ -116,6 +121,12 @@ namespace PGvZOnlineMod.Core
             if (_config.CursorHz is < 2 or > 60)
             {
                 _config.CursorHz = 10;
+            }
+            // NaN/越界都要收：血量倍率参与生成，脏值会造出无敌僵尸
+            if (float.IsNaN(_config.ZombieHpPerExtraPlayer) || _config.ZombieHpPerExtraPlayer < 0f
+                || _config.ZombieHpPerExtraPlayer > 3f)
+            {
+                _config.ZombieHpPerExtraPlayer = 0.35f;
             }
             if (!existed)
             {

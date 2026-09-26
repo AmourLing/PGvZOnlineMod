@@ -8,6 +8,7 @@ PGvZOnlineMod 打包脚本：
 用法:  python 打包.py
 """
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 PUBLISH = os.path.join(ROOT, "publish")
 MOD_DLL = os.path.join(ROOT, "bin", "Release", "net6.0", "PGvZOnlineMod.dll")
 README = os.path.join(ROOT, "使用说明.txt")
+TEMPLATE = os.path.join(ROOT, "使用说明模板.txt")
 CONFIG_SRC = os.path.join(ROOT, "配置模板", "联机配置.json")
 GAME_DLL_DIR = os.path.join(ROOT, "..", "..", "PlantGirlsVsZombies", "LawnDLL")
 LIDGRE_DLL = os.path.join(GAME_DLL_DIR, "Lidgren.Network.Core.dll")
@@ -71,9 +73,13 @@ def main():
         return 1
     print("## VerifyHost 回归 OK")
 
-    if not os.path.exists(README):
-        with open(README, "w", encoding="utf-8") as f:
-            f.write(open(os.path.join(ROOT, "使用说明模板.txt"), encoding="utf-8").read())
+    # 包内说明一律从模板重新生成：仓库里的 使用说明.txt 只是上次打包的产物，
+    # 沿用会把过期文案打进发布包（历史上漏出过"双人共用卡槽"的旧版）。
+    if not os.path.exists(TEMPLATE):
+        print("## 缺少 %s，中止" % TEMPLATE)
+        return 1
+    shutil.copyfile(TEMPLATE, README)
+    print("## 使用说明已从模板重新生成")
 
     if not os.path.exists(CONFIG_SRC):
         print("## 缺少 %s，中止" % CONFIG_SRC)

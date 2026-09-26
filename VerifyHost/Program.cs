@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
+using Lawn;
+using Lidgren.Network;
 using PGvZOnlineMod.Core;
 using PGvZOnlineMod.Net;
 using PGvZOnlineMod.Protocol;
@@ -37,10 +39,200 @@ namespace PGvZOnlineVerify
         {
             Console.WriteLine("== PGvZOnlineMod 离线验证 ==");
             TestRegistry();
+            TestLevels();
+            TestHostingSeat();
             TestLoopback();
+            TestExtendedPackets();
             TestDetour();
             Console.WriteLine($"== 结果：通过 {_passes} / 失败 {_failures} ==");
             return _failures == 0 ? 0 : 1;
+        }
+
+        // ------------------------------------------------------------ 1c. 主机座位占位
+
+        /// <summary>
+        /// 主机必须把自己算进 0 号位。历史上漏了这一笔，后果是连锁的：
+        /// 选卡门闩在主机侧看不到自己 → 客人一点就绪主机就广播 AllReady，
+        /// 客人进战场而主机还停在选卡界面；HUD 人数少一个；主机自己暂停不生效；
+        /// 按人数加压数不到主机（永远 1 人 → 加压静默失效）。
+        /// </summary>
+        private static void TestHostingSeat()
+        {
+            Console.WriteLine("-- 主机座位与选卡门闩 --");
+            PGvZOnlineMod.Sync.Session.StartHosting(null);
+            bool occupied = PGvZOnlineMod.Sync.Session.SlotOccupied[0];
+            int live = PGvZOnlineMod.Sync.Session.LivePlayerCount();
+
+            // 主机自己没选完卡之前，绝不能算"全员就绪"（漏算 0 号位时这里会假绿）
+            bool readyTooEarly = PGvZOnlineMod.Sync.Session.AllReadyNow;
+            var deck = new int[10];
+            var imit = new int[10];
+            for (int i = 0; i < 10; i++)
+            {
+                deck[i] = -1;
+                imit[i] = -1;
+            }
+            PGvZOnlineMod.Sync.Session.NoteLocalReady(deck, imit);
+            bool readyAfter = PGvZOnlineMod.Sync.Session.AllReadyNow;
+            PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+
+            Check("建房后主机占住 0 号位且在场人数为 1", occupied && live == 1,
+                "SlotOccupied[0]=" + occupied + " 在场=" + live);
+            Check("选卡门闩：主机选完前不算全员就绪、选完后才算",
+                !readyTooEarly && readyAfter,
+                "选完前=" + readyTooEarly + " 选完后=" + readyAfter);
+        }
+
+        // ------------------------------------------------------------ 1b. 关卡表映射
+
+        /// <summary>
+        /// 联机关卡表现在直接取游戏的 ChallengeScreen.gChallengeDefs。
+        /// 断言只针对**语义**（生存族齐备、排除项确实被排除、排序稳定、分页不重不漏），
+        /// 期望值取自游戏自己的 GameMode 成员，不重抄模组的算式。
+        /// </summary>
+        private static void TestLevels()
+        {
+            Console.WriteLine("-- 关卡表 --");
+            var levels = PGvZOnlineMod.Sync.Session.Levels;
+            Console.WriteLine("  共 " + levels.Length + " 关可选 / 分类 "
+                + string.Join("、", PGvZOnlineMod.Sync.Session.LevelPageFilters()));
+
+            bool basics = levels != null && levels.Length >= 18;
+            var seenModes = new HashSet<GameMode>();
+            for (int i = 0; basics && i < levels.Length; i++)
+            {
+                var lv = levels[i];
+                if (string.IsNullOrEmpty(lv.Name) || string.IsNullOrEmpty(lv.PageLabel))
+                {
+                    basics = false;
+                }
+                if (!seenModes.Add(lv.Mode))
+                {
+                    basics = false; // 同一 GameMode 不该出现两次
+                }
+            }
+            Check("关卡表：非空、有名、GameMode 不重复", basics, "共 " + (levels?.Length ?? 0) + " 项");
+
+            bool survivalOk = true;
+            var families = new[]
+            {
+                GameMode.SurvivalNormalStage1, GameMode.SurvivalHardStage1,
+                GameMode.SurvivalEndlessStage1, GameMode.SurvivalHellStage1,
+            };
+            foreach (var baseMode in families)
+            {
+                for (int s = 0; s < 5; s++)
+                {
+                    var want = baseMode + s;
+                    bool found = false;
+                    foreach (var lv in levels)
+                    {
+                        if (lv.Mode == want && lv.PageLabel == "生存")
+                        {
+                            found = true;
+                        }
+                    }
+                    if (!found)
+                    {
+                        survivalOk = false;
+                        Console.WriteLine("  缺生存条目 " + want + "=" + (int)want);
+                    }
+                }
+            }
+            // 核心不变量：开放表 = 生存族 ∪ 输入模型兼容的小游戏白名单。
+            // 出怪已由总闸接管（Challenge.UpdateZombieSpawning 在客户端整体跳过），
+            // 所以拒绝理由只剩"需要额外输入转发"：老虎机/天降种子/宝石迷阵/敲僵尸/砸罐子。
+            var allowedExtra = new HashSet<GameMode>
+            {
+                GameMode.ChallengeWarAndPeas, GameMode.ChallengeWallnutBowling,
+                GameMode.ChallengeFinalBoss, GameMode.ChallengeFinalBoss2,
+            };
+            var mustBeAbsent = new[]
+            {
+                GameMode.ChallengeSlotMachine, GameMode.ChallengeRainingSeeds,
+                GameMode.ChallengeBeghouled, GameMode.ChallengeWhackAZombie,
+                GameMode.ScaryPotter1, GameMode.PuzzleIZombie1, GameMode.ChallengeZenGarden,
+            };
+            bool whitelistOnly = true, absentOk = true;
+            var present = new HashSet<GameMode>();
+            foreach (var lv in levels)
+            {
+                int m = (int)lv.Mode;
+                bool survival = (m >= (int)GameMode.SurvivalNormalStage1 && m <= (int)GameMode.SurvivalEndlessStage5)
+                    || (m >= (int)GameMode.SurvivalHellStage1 && m <= (int)GameMode.SurvivalHellStage5)
+                    || (m >= (int)GameMode.BigPoolSurvivalNormalStage && m <= (int)GameMode.BigPoolSurvivalHellStage);
+                present.Add(lv.Mode);
+                if (!survival && !allowedExtra.Contains(lv.Mode))
+                {
+                    whitelistOnly = false;
+                    Console.WriteLine("  意外开放: " + lv.Mode + " (" + lv.FullLabel + ")");
+                }
+            }
+            foreach (var bad in mustBeAbsent)
+            {
+                if (present.Contains(bad))
+                {
+                    absentOk = false;
+                    Console.WriteLine("  不该开放却出现: " + bad);
+                }
+            }
+            Check("关卡表：只开放生存族 + 输入兼容的小游戏白名单", whitelistOnly);
+            Check("关卡表：老虎机/天降种子/宝石迷阵/敲僵尸/砸罐子/我是僵尸/禅境均未开放", absentOk);
+            Check("关卡表：生存四族各 5 场景共 20 项齐备", survivalOk);
+
+            // 排序：页签 → GameMode 数值。曾经按游戏的行/列排，结果大泳池那几条
+            // （行列是负数）被顶到列表最前面，这里锁住正确顺序。
+            bool ordered = true;
+            for (int i = 1; i < levels.Length; i++)
+            {
+                var a = levels[i - 1];
+                var b = levels[i];
+                if (a.PageOrder > b.PageOrder
+                    || (a.PageOrder == b.PageOrder && (int)a.Mode > (int)b.Mode))
+                {
+                    ordered = false;
+                }
+            }
+            Check("关卡表：按页签→GameMode 稳定排序", ordered);
+
+            // 同一页签里显示名不能撞车：游戏的生存串只到"白天/黑夜/泳池"这一层，
+            // 四个难度会重名，所以模组必须补族名前缀。断言只看"唯一性"，
+            // 不依赖翻译结果（离线时游戏字符串表是空的，会返回 <Missing KEY>）。
+            bool namesUnique = true;
+            var perPage = new Dictionary<string, HashSet<string>>();
+            foreach (var lv in levels)
+            {
+                if (!perPage.TryGetValue(lv.PageLabel, out var set))
+                {
+                    perPage[lv.PageLabel] = set = new HashSet<string>();
+                }
+                if (!set.Add(lv.Name))
+                {
+                    namesUnique = false;
+                    Console.WriteLine("  同页签重名: " + lv.PageLabel + " / " + lv.Name);
+                }
+            }
+            Check("关卡表：同页签内显示名唯一（生存族已带难度前缀）", namesUnique);
+
+            var filters = PGvZOnlineMod.Sync.Session.LevelPageFilters();
+            var union = new HashSet<int>();
+            bool partitionOk = filters != null && filters.Count >= 1 && filters[0] == "全部";
+            for (int f = 1; partitionOk && f < filters.Count; f++)
+            {
+                foreach (int idx in PGvZOnlineMod.Sync.Session.LevelIndicesOfPage(filters[f]))
+                {
+                    if (!union.Add(idx))
+                    {
+                        partitionOk = false; // 分类之间不该重叠
+                    }
+                }
+            }
+            partitionOk &= union.Count == levels.Length;
+            partitionOk &= PGvZOnlineMod.Sync.Session.LevelIndicesOfPage("全部").Count == levels.Length;
+            partitionOk &= PGvZOnlineMod.Sync.Session.ClampLevelIndex(-5) == 0
+                && PGvZOnlineMod.Sync.Session.ClampLevelIndex(99999) == levels.Length - 1;
+            Check("关卡表：分类分页不重不漏且下标越界兜底", partitionOk,
+                "分类 " + (filters?.Count ?? 0) + " 个 / 覆盖 " + union.Count + "/" + levels.Length);
         }
 
         // ------------------------------------------------------------ 1. 注册表
@@ -135,8 +327,9 @@ namespace PGvZOnlineVerify
 
                 var zs = new List<NetZombieSpawn>
                 {
-                    new NetZombieSpawn { NetId = 7, ZombieType = 3, Row = 4, X = 800.5f, Y = 90f, Hp = 270 },
-                    new NetZombieSpawn { NetId = 9, ZombieType = 0, Row = 0, X = 10f, Y = 10f, Hp = 1 },
+                    // MaxHp 与 Hp 故意取不同值：加压后的僵尸血量≠上限，同值会漏掉字段写串
+                    new NetZombieSpawn { NetId = 7, ZombieType = 3, Row = 4, X = 800.5f, Y = 90f, Hp = 270, MaxHp = 553 },
+                    new NetZombieSpawn { NetId = 9, ZombieType = 0, Row = 0, X = 10f, Y = 10f, Hp = 1, MaxHp = 1200 },
                 };
                 var ps = new List<NetPlantSpawn>
                 {
@@ -242,6 +435,7 @@ namespace PGvZOnlineVerify
                         Packets.ReadSpawnBatch(im, zs, ps);
                         spawnOk = zs.Count == 2 && ps.Count == 1
                             && zs[0].NetId == 7 && zs[0].ZombieType == 3 && zs[0].Row == 4 && zs[0].X == 800.5f && zs[0].Hp == 270
+                            && zs[0].MaxHp == 553 && zs[1].MaxHp == 1200
                             && zs[1].NetId == 9 && zs[1].Hp == 1
                             && ps[0].NetId == 11 && ps[0].SeedType == 40;
                         break;
@@ -328,6 +522,134 @@ namespace PGvZOnlineVerify
         /// 真实触发 detour 并断言触发次数——验证钩子机制本身离线可用。
         /// （Plant.IsUpgrade 是静态无副作用方法，可离线安全调用。）
         /// </summary>
+        /// <summary>
+        /// 后加消息的往返覆盖。老环测只覆盖到 Kick 之前那批，
+        /// PauseRequest（现在带槽位）、SeedState（位图）、RakePlaced 这些都没人验过——
+        /// MaxHp 那次的教训就是"没覆盖的字段"等于"会写串的字段"。
+        /// </summary>
+        private static void TestExtendedPackets()
+        {
+            Console.WriteLine("-- 扩展消息 --");
+            const int port = 27233;
+            using var host = new NetMgr();
+            using var client = new NetMgr();
+            var connected = new ManualResetEventSlim(false);
+            var arrived = new ManualResetEventSlim(false);
+            int got = 0;
+            bool sunProd = false, skySun = false, pause = false, rake = false, cutscene = false,
+                accel = false, allReady = false, cursorAt = false, chatAt = false, roomReady = false,
+                kick = false, seed = false;
+
+            client.OnConnected += (c, r) => connected.Set();
+            client.OnData += im =>
+            {
+                var t = (PacketType)im.ReadByte();
+                switch (t)
+                {
+                    case PacketType.SunProduced:
+                        Packets.ReadSunProduced(im, out uint nid, out int cnt);
+                        sunProd = nid == 777 && cnt == 4321;
+                        break;
+                    case PacketType.SkySun:
+                        Packets.ReadSkySun(im, out float sx, out int coin, out int cd);
+                        skySun = sx > 299.9f && sx < 300.1f && coin == 1 && cd == 555;
+                        break;
+                    case PacketType.PauseRequest:
+                        Packets.ReadPauseRequest(im, out int pslot, out bool pz);
+                        pause = pslot == 2 && pz;
+                        break;
+                    case PacketType.RakePlaced:
+                        Packets.ReadRakePlaced(im, out int rx, out int ry);
+                        rake = rx == 3 && ry == 5;
+                        break;
+                    case PacketType.CutsceneZombie:
+                        Packets.ReadCutsceneZombie(im, out int zt, out int gx, out int gy);
+                        cutscene = zt == 12 && gx == 8 && gy == 1;
+                        break;
+                    case PacketType.Acceleration:
+                        Packets.ReadAcceleration(im, out int num, out int den);
+                        accel = num == 3 && den == 2;
+                        break;
+                    case PacketType.AllReady:
+                        allReady = true;
+                        break;
+                    case PacketType.CursorAt:
+                        Packets.ReadCursorAt(im, out int cslot, out float cx, out float cy);
+                        cursorAt = cslot == 3 && cx == 11.5f && cy == 22.25f;
+                        break;
+                    case PacketType.ChatAt:
+                        Packets.ReadChatAt(im, out int chslot, out string txt);
+                        chatAt = chslot == 1 && txt == "救命！我这行顶不住";
+                        break;
+                    case PacketType.RoomReadyRequest:
+                        roomReady = Packets.ReadRoomReadyRequest(im);
+                        break;
+                    case PacketType.Kick:
+                        kick = Packets.ReadKick(im) == "你被主机踢出了房间";
+                        break;
+                    case PacketType.SeedState:
+                        seed = Packets.ReadSeedState(im) == 3;
+                        break;
+                }
+                if (++got >= 12)
+                {
+                    arrived.Set();
+                }
+            };
+
+            // Lidgren 的事件只在 Poll() 里派发，不轮询就永远连不上
+            var sw = Stopwatch.StartNew();
+            bool link = host.StartHost(port) && client.StartClient("127.0.0.1", port);
+            while (link && !connected.IsSet && sw.Elapsed.TotalSeconds < 5)
+            {
+                host.Poll();
+                client.Poll();
+                Thread.Sleep(1);
+            }
+            Check("扩展：建房与连接", link && connected.IsSet);
+
+            void Send(Action<NetOutgoingMessage> write)
+            {
+                var m = host.CreateMessage();
+                if (m == null)
+                {
+                    return;
+                }
+                write(m);
+                host.SendReliableToClients(m);
+            }
+            if (link && connected.IsSet)
+            {
+                Send(m => Packets.WriteSunProduced(m, 777, 4321));
+                Send(m => Packets.WriteSkySun(m, 300f, 1, 555));
+                Send(m => Packets.WritePauseRequest(m, 2, true));
+                Send(m => Packets.WriteRakePlaced(m, 3, 5));
+                Send(m => Packets.WriteCutsceneZombie(m, 12, 8, 1));
+                Send(m => Packets.WriteAcceleration(m, 3, 2));
+                Send(m => Packets.WriteAllReady(m));
+                Send(m => Packets.WriteCursorAt(m, 3, 11.5f, 22.25f));
+                Send(m => Packets.WriteChatAt(m, 1, "救命！我这行顶不住"));
+                Send(m => Packets.WriteRoomReadyRequest(m, true));
+                Send(m => Packets.WriteKick(m, "你被主机踢出了房间"));
+                Send(m => Packets.WriteSeedState(m, 3));
+                while (!arrived.IsSet && sw.Elapsed.TotalSeconds < 5)
+                {
+                    host.Poll();
+                    client.Poll();
+                    Thread.Sleep(1);
+                }
+            }
+
+            Check("扩展：产出/天降阳光/暂停(含槽位)/钉耙 往返", sunProd && skySun && pause && rake,
+                "sun=" + sunProd + " sky=" + skySun + " pause=" + pause + " rake=" + rake);
+            Check("扩展：预览僵尸/加速/全员就绪/光标中继 往返", cutscene && accel && allReady && cursorAt,
+                "cut=" + cutscene + " accel=" + accel + " allReady=" + allReady + " cursor=" + cursorAt);
+            Check("扩展：聊天中继(中文)/房间准备/踢人/选卡位图 往返", chatAt && roomReady && kick && seed,
+                "chat=" + chatAt + " ready=" + roomReady + " kick=" + kick + " seed=" + seed);
+            host.Shutdown();
+            client.Shutdown();
+        }
+
         private static void TestDetour()
         {
             try

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Lawn;
 using Sexy;
 using Sexy.TodLib;
@@ -8,8 +9,15 @@ namespace PGvZOnlineMod.Ui
     /// <summary>
     /// 联机整页 —— 与"在线关卡"页同一家族的页面模式（镜像 Lawn.ChallengeScreen）：
     /// 全屏 Widget + DrawImageBox 圆角背景 + GameButton(IMAGE_SEEDCHOOSER_BUTTON2) 按钮族。
-    /// 打开：主菜单 [联机] 按钮按下 → KillGameSelector → mGameScene=Challenge → 挂整页
-    /// （镜像 LawnApp.ShowChallengeScreen）；关闭：移除整页 → ShowGameSelector。
+    /// 打开：主菜单 [联机] 按钮按下 → KillGameSelector → mGameScene=Challenge → 挂整页；
+    /// 关闭：移除整页 → ShowGameSelector。
+    ///
+    /// 排版两条铁律（都是实机截图里踩出来的）：
+    /// 1) NewLawnButton 的贴图按**原始尺寸**绘制（ButtonWidget.DrawImage 传源矩形，不拉伸），
+    ///    而标签按 mWidth 居中 —— 把按钮 Resize 成 330/470 宽只会让文字飘到图外面。
+    ///    所以真按钮一律用贴图原始大小（游戏自己也是这样，见 AwardScreen 用 image.mWidth）。
+    /// 2) 需要"整条宽 bar"的地方（房间列表 / 座位行 / 踢出 / 选关下拉）不用按钮控件，
+    ///    改为自绘 + 在本控件 MouseDown 里做命中测试。
     /// </summary>
     public class OnlineLobbyScreen : Widget, ButtonListener
     {
@@ -26,6 +34,23 @@ namespace PGvZOnlineMod.Ui
         private const int KickBtnIdBase = 125;
         private const int RoomButtonIdBase = 120;
         private const int RoomButtonCount = 4;
+        private const int LvlPageIdBase = 150; // 下拉的分类行
+        private const int LvlRowIdBase = 160;  // 下拉的关卡条目行
+        private const int LvlPrevId = 170;
+        private const int LvlNextId = 171;
+        private const int TabCount = 6;        // 全部 + 五个页签
+        private const int RowCount = 4;        // 下拉每页显示几关
+
+        private enum HitKind { Info, Seat, RoomRow, Kick, Tab, LevelRow, Pager }
+
+        /// <summary>自绘条目：几何 + 文案 + 点下去等价于按哪个按钮 id（Id 为负＝纯展示）。</summary>
+        private struct Hit
+        {
+            public HitKind Kind;
+            public int X, Y, W, H, Id;
+            public string Left, Main, Right;
+            public bool Selected;
+        }
 
         private static OnlineLobbyScreen _inst;
         private static NewLawnButton _menuButton;
@@ -38,19 +63,45 @@ namespace PGvZOnlineMod.Ui
         private NewLawnButton _levelBtn;
         private NewLawnButton _startBtn;
         private NewLawnButton _disconnectBtn;
+        private NewLawnButton _saveNickBtn;
+        private NewLawnButton _readyBtn;
         private IpInputWidget _ipEdit;
         private IpInputWidget _portEdit;
         private IpInputWidget _nickEdit;
-        private NewLawnButton _saveNickBtn;
-        private NewLawnButton _readyBtn;
-        private readonly NewLawnButton[] _kickBtns = new NewLawnButton[Sync.Session.MaxPlayers];
-        private NewLawnButton[] _roomButtons = new NewLawnButton[4];
+
+        private bool _dropOpen;
+        private int _dropPage;
+        private int _dropPages = 1;
+        private int _dropFilter; // 0 = 全部
+        private List<string> _dropFilters;
+        private List<int> _dropIndices = new List<int>();
+
+        private readonly List<Hit> _hits = new List<Hit>();
         private long _roomListVersion = -1;
         private bool _roomPhase;
         private int _halfDeltaWidth;
         private int _halfDeltaHeight;
 
         public static bool ScreenOpen => _inst != null;
+
+        /// <summary>按钮贴图原始尺寸：游戏自己也是按这个大小摆的，不要拉伸。</summary>
+        private static int BtnW
+        {
+            get
+            {
+                var img = AtlasResources.IMAGE_SEEDCHOOSER_BUTTON2;
+                return img != null && img.mWidth > 40 ? img.mWidth : 130;
+            }
+        }
+
+        private static int BtnH
+        {
+            get
+            {
+                var img = AtlasResources.IMAGE_SEEDCHOOSER_BUTTON2;
+                return img != null && img.mHeight > 20 ? img.mHeight : 40;
+            }
+        }
 
         // LawnCommon 是 internal，DrawImageBox（九宫格圆角背景）经缓存委托反射调用，
         // 静态构造一次，Draw 每帧只做一次委托调用
@@ -171,59 +222,48 @@ namespace PGvZOnlineMod.Ui
         {
             _app = app;
             mClip = false;
+            mWantsFocus = true;
+
+            int bw = BtnW, bh = BtnH;
 
             _backButton = MakeButton(BackId, "[BACK_TO_MENU]");
-            _backButton.Resize(18, Constants.BackBufferSize.X - 40, 130, 40);
+            _backButton.Resize(18, Constants.BackBufferSize.X - 40, bw, bh);
 
-            // 昵称（与标题同区，独立一行）+ 立即保存按钮
+            // 大厅：昵称行
             _nickEdit = new IpInputWidget { AllowAnyChar = true, MaxLength = 12 };
-            _nickEdit.Resize(280, 54, 200, 34);
+            _nickEdit.Resize(268, 50, 200, 34);
             _nickEdit.SetText(Core.ModEnv.GetConfig().Nickname ?? "玩家");
             AddWidget(_nickEdit);
-
             _saveNickBtn = MakeButton(SaveNickId, "保存昵称");
-            _saveNickBtn.Resize(495, 50, 110, 40);
+            _saveNickBtn.Resize(486, 46, bw, bh);
 
-            _readyBtn = MakeButton(ReadyBtnId, "准备");
-            _readyBtn.Resize(165, 250, 380, 40);
-            _readyBtn.mVisible = false;
-            for (int i = 0; i < Sync.Session.MaxPlayers; i++)
-            {
-                _kickBtns[i] = MakeButton(KickBtnIdBase + i, "踢出");
-                _kickBtns[i].Resize(665, 104 + i * 44, 80, 32);
-                _kickBtns[i].mVisible = false;
-            }
-
-            // 局域网房间列表（主路径）：4 个固定槽位按钮，按发现结果填充
-            for (int i = 0; i < _roomButtons.Length; i++)
-            {
-                _roomButtons[i] = MakeButton(RoomButtonIdBase + i, "");
-                _roomButtons[i].Resize(165, 138 + i * 48, 470, 40);
-                _roomButtons[i].mVisible = false;
-            }
-
-            _levelBtn = MakeButton(LevelId, "关卡: ?");
-            _levelBtn.Resize(165, 240, 380, 40);
-            _startBtn = MakeButton(StartId, "开始游戏");
-            _startBtn.Resize(575, 240, 150, 40);
-            _disconnectBtn = MakeButton(DisconnectId, "断开连接");
-            _disconnectBtn.Resize(340, 310, 160, 40);
-
-            // 手动加入：第一行 IP+端口，第二行两个按钮
+            // 大厅：手动加入
             _ipEdit = new IpInputWidget();
-            _ipEdit.Resize(165, 370, 240, 34);
+            _ipEdit.Resize(160, 300, 240, 34);
             _ipEdit.SetText(Core.ModEnv.GetConfig().LastIp ?? "127.0.0.1");
             AddWidget(_ipEdit);
-
             _portEdit = new IpInputWidget { MaxLength = 5 };
-            _portEdit.Resize(425, 370, 100, 34);
+            _portEdit.Resize(420, 300, 90, 34);
             _portEdit.SetText(Core.ModEnv.GetConfig().LastPort.ToString());
             AddWidget(_portEdit);
-
             _hostBtn = MakeButton(HostId, "建立房间");
-            _hostBtn.Resize(165, 412, 180, 40);
+            _hostBtn.Resize(160, 346, bw, bh);
             _joinBtn = MakeButton(JoinId, "加入房间");
-            _joinBtn.Resize(365, 412, 180, 40);
+            _joinBtn.Resize(170 + bw, 346, bw, bh);
+
+            // 房间内：真按钮一律贴图原始尺寸，宽 bar 全部自绘
+            _levelBtn = MakeButton(LevelId, "选关");
+            _levelBtn.Resize(160, 232, bw, bh);
+            _levelBtn.mVisible = false;
+            _startBtn = MakeButton(StartId, "开始游戏");
+            _startBtn.Resize(160, 280, bw, bh);
+            _startBtn.mVisible = false;
+            _readyBtn = MakeButton(ReadyBtnId, "准备");
+            _readyBtn.Resize(160, 280, bw, bh);
+            _readyBtn.mVisible = false;
+            _disconnectBtn = MakeButton(DisconnectId, "离开房间");
+            _disconnectBtn.Resize(170 + bw, 280, bw, bh);
+            _disconnectBtn.mVisible = false;
 
             RefreshUi();
         }
@@ -240,42 +280,214 @@ namespace PGvZOnlineMod.Ui
             return b;
         }
 
+        // ------------------------------------------------------------ 状态刷新（同时重建自绘条目）
+
         private void RefreshUi()
         {
             bool room = Sync.Session.Phase != Sync.SessionPhase.Idle;
+            bool host = Sync.Session.IsHost;
+            bool connected = Sync.Session.Net.IsConnected;
             _roomPhase = room;
+            _hits.Clear();
+
             _hostBtn.mVisible = !room;
             _joinBtn.mVisible = !room;
             _ipEdit.mVisible = !room;
             _portEdit.mVisible = !room;
             _nickEdit.mVisible = !room;
             _saveNickBtn.mVisible = !room;
-            _levelBtn.mVisible = room && Sync.Session.IsHost;
-            _startBtn.mVisible = room && Sync.Session.IsHost;
-            _readyBtn.mVisible = room && !Sync.Session.IsHost;
             _disconnectBtn.mVisible = room;
-            for (int i = 0; i < Sync.Session.MaxPlayers; i++)
+
+            bool canPick = room && host && connected;
+            if (!canPick)
             {
-                int guestSlot = i + 1;
-                _kickBtns[i].mVisible = room && Sync.Session.IsHost && guestSlot < Sync.Session.MaxPlayers
-                    && Sync.Session.SlotOccupied[guestSlot];
+                _dropOpen = false; // 否则[选关]按钮隐掉了，展开的下拉关不上
             }
-            if (room && !Sync.Session.IsHost)
+            _levelBtn.mVisible = canPick;
+            _startBtn.mVisible = room && host;
+            _readyBtn.mVisible = room && !host;
+            if (_readyBtn.mVisible)
             {
                 _readyBtn.mLabel = Sync.Session.AmRoomReady ? "取消准备" : "准备";
             }
-            RefreshRoomRows();
-            if (room)
+
+            if (!room)
             {
-                bool host = Sync.Session.IsHost;
-                bool connected = Sync.Session.Net.IsConnected;
-                var level = Sync.Session.Levels[Math.Clamp(Sync.Session.SelectedLevelIndex, 0, Sync.Session.Levels.Length - 1)];
-                _levelBtn.mLabel = "关卡: " + level.Label;
-                _startBtn.mLabel = host ? "开始游戏" : "等待主机开始…";
-                _levelBtn.mDisabled = !host || !connected;
-                _startBtn.mDisabled = !host || !connected;
+                BuildLobbyHits();
+            }
+            else
+            {
+                BuildRoomHits(host, connected);
             }
             MarkDirty();
+        }
+
+        /// <summary>局域网房间条目：自绘整条 bar，点一条即加入。</summary>
+        private void BuildLobbyHits()
+        {
+            for (int i = 0; i < RoomButtonCount && i < Sync.Session.RoomList.Count; i++)
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.RoomRow,
+                    X = 160,
+                    Y = 112 + i * 38,
+                    W = 480,
+                    H = 34,
+                    Id = RoomButtonIdBase + i,
+                    Main = Clip(Sync.Session.RoomList[i].DisplayText, 34),
+                });
+            }
+        }
+
+        private void BuildRoomHits(bool host, bool connected)
+        {
+            if (_dropOpen)
+            {
+                // 展开时只留下拉：座位条与它 y 区间重叠，两张一起画就又糊成一团了
+                BuildDropdownHits();
+                return;
+            }
+
+            int selected = Sync.Session.ClampLevelIndex(Sync.Session.SelectedLevelIndex);
+            var level = Sync.Session.Levels[selected];
+
+            for (int ps = 0; ps < Sync.Session.MaxPlayers; ps++)
+            {
+                bool occupied = ps == 0 || Sync.Session.SlotOccupied[ps];
+                string nick = occupied
+                    ? (!string.IsNullOrEmpty(Sync.Session.Nicks[ps]) ? Sync.Session.Nicks[ps] : "（未命名）")
+                    : "（等待加入…）";
+                if (ps == Sync.Session.MySlot)
+                {
+                    nick += "（你）";
+                }
+                string right = !occupied ? ""
+                    : ps == 0 ? "房主"
+                    : Sync.Session.RoomReadyOf(ps) ? "✓ 已准备" : "未准备";
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Seat,
+                    X = 160,
+                    Y = 52 + ps * 40,
+                    W = 390,
+                    H = 36,
+                    Id = -1,
+                    Left = ps == 0 ? "主机位" : "客人位 " + (ps + 1),
+                    Main = Clip(nick, 14),
+                    Right = right,
+                    Selected = ps == Sync.Session.MySlot,
+                });
+                if (host && occupied && ps != 0)
+                {
+                    _hits.Add(new Hit
+                    {
+                        Kind = HitKind.Kick,
+                        X = 556,
+                        Y = 58 + ps * 40,
+                        W = 76,
+                        H = 24,
+                        Id = KickBtnIdBase + ps - 1,
+                        Main = "踢出",
+                    });
+                }
+            }
+
+            if (host && connected)
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Info, X = 172 + BtnW, Y = 244, W = 460, H = 20, Id = -1,
+                    Main = "当前：" + level.FullLabel,
+                });
+            }
+            else if (!host)
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Info, X = 160, Y = 244, W = 480, H = 20, Id = -1,
+                    Main = "关卡：" + level.FullLabel + "（由主机选择）",
+                });
+            }
+            _hits.Add(new Hit
+            {
+                Kind = HitKind.Info, X = 160, Y = 328, W = 480, H = 16, Id = -1,
+                Main = Sync.Session.LevelRuleHint(level.Mode),
+            });
+            if (host && connected
+                && (Sync.Session.DiscoveryReqAge < 0 || Sync.Session.DiscoveryReqAge > 15))
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Info, X = 160, Y = 346, W = 480, H = 16, Id = -1,
+                    Main = "对方一直搜不到本机？防火墙请允许『专用+公用』，或把热点网络设为专用",
+                });
+            }
+        }
+
+        /// <summary>选关下拉：分类 tab + 关卡条目 + 翻页。全部自绘，不依赖按钮控件。</summary>
+        private void BuildDropdownHits()
+        {
+            _dropFilters ??= Sync.Session.LevelPageFilters();
+            if (_dropFilter >= _dropFilters.Count)
+            {
+                _dropFilter = 0;
+            }
+            _dropIndices = Sync.Session.LevelIndicesOfPage(_dropFilters[_dropFilter]);
+            _dropPages = Math.Max(1, (_dropIndices.Count + RowCount - 1) / RowCount);
+            if (_dropPage >= _dropPages)
+            {
+                _dropPage = 0;
+            }
+            int selected = Sync.Session.ClampLevelIndex(Sync.Session.SelectedLevelIndex);
+
+            for (int i = 0; i < _dropFilters.Count && i < TabCount; i++)
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Tab,
+                    X = 166 + i * 78,
+                    Y = 56,
+                    W = 74,
+                    H = 22,
+                    Id = LvlPageIdBase + i,
+                    Main = _dropFilters[i],
+                    Selected = i == _dropFilter,
+                });
+            }
+            for (int i = 0; i < RowCount; i++)
+            {
+                int k = _dropPage * RowCount + i;
+                if (k >= _dropIndices.Count)
+                {
+                    break;
+                }
+                int li = _dropIndices[k];
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.LevelRow,
+                    X = 166,
+                    Y = 84 + i * 28,
+                    W = 468,
+                    H = 26,
+                    Id = LvlRowIdBase + i,
+                    Main = Clip(Sync.Session.Levels[li].Name, 26),
+                    Selected = li == selected,
+                });
+            }
+            if (_dropPages > 1)
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Pager, X = 166, Y = 200, W = 86, H = 22,
+                    Id = LvlPrevId, Main = "< 上一页",
+                });
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Pager, X = 258, Y = 200, W = 86, H = 22,
+                    Id = LvlNextId, Main = "下一页 >",
+                });
+            }
         }
 
         // ------------------------------------------------------------ 帧更新（镜像 ChallengeScreen.UpdateScreen）
@@ -293,21 +505,7 @@ namespace PGvZOnlineMod.Ui
             if (_roomListVersion != Sync.Session.RoomListVersion)
             {
                 _roomListVersion = Sync.Session.RoomListVersion;
-                RefreshRoomRows();
-            }
-        }
-
-        /// <summary>把发现结果填进 4 个固定槽位按钮（真按钮，点击即加入）。</summary>
-        private void RefreshRoomRows()
-        {
-            for (int i = 0; i < RoomButtonCount; i++)
-            {
-                var room = i < Sync.Session.RoomList.Count ? Sync.Session.RoomList[i] : null;
-                _roomButtons[i].mVisible = !_roomPhase && room != null;
-                if (room != null)
-                {
-                    _roomButtons[i].mLabel = room.DisplayText;
-                }
+                RefreshUi();
             }
         }
 
@@ -315,82 +513,196 @@ namespace PGvZOnlineMod.Ui
 
         public override void Draw(Graphics g)
         {
-            g.SetLinearBlend(true);
-            s_drawImageBox(g, new TRect(-_halfDeltaWidth, -_halfDeltaHeight, mWidth, mHeight),
-                AtlasResources.IMAGE_ALMANAC_ROUNDED_OUTLINE);
-
-            TodCommon.TodDrawString(g, "植物娘联机", 500, 22, Resources.FONT_DWARVENTODCRAFT15,
-                new SexyColor(220, 220, 220), DrawStringJustification.Center);
-
-            if (!_roomPhase)
+            try
             {
-                // 昵称行（输入框 280,54,200,34，标签与其左对齐同高）
-                TodCommon.TodDrawString(g, "你的昵称:", 165, 62, Resources.FONT_BRIANNETOD16,
-                    new SexyColor(220, 220, 220), DrawStringJustification.Left);
+                g.SetLinearBlend(true);
+                s_drawImageBox(g, new TRect(-_halfDeltaWidth, -_halfDeltaHeight, mWidth, mHeight),
+                    AtlasResources.IMAGE_ALMANAC_ROUNDED_OUTLINE);
 
-                // 区块一：局域网房间（房间是真按钮，这里只画区块标题与空态）
-                TodCommon.TodDrawString(g, "局域网房间（自动搜索，点按钮加入）：", 165, 106, Resources.FONT_BRIANNETOD16,
-                    new SexyColor(220, 220, 220), DrawStringJustification.Left);
-                if (Sync.Session.RoomList.Count == 0)
+                Text(g, "植物娘联机", 400, 22, Resources.FONT_DWARVENTODCRAFT15,
+                    new SexyColor(220, 220, 220), DrawStringJustification.Center);
+
+                if (!_roomPhase)
                 {
-                    TodCommon.TodDrawString(g, "正在搜索…（对方点[建立房间]后几秒内出现）",
-                        400, 154, Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+                    DrawLobby(g);
+                }
+                else if (_dropOpen)
+                {
+                    // 下拉面板底：盖住座位区（经典下拉行为），条目随后由 DrawHits 画在上面
+                    g.SetColor(new SexyColor(24, 28, 20, 246));
+                    g.FillRect(158, 50, 484, 178);
+                    g.SetColor(new SexyColor(170, 220, 150, 220));
+                    g.DrawRect(158, 50, 484, 178);
+                    Text(g, "第 " + (_dropPage + 1) + "/" + _dropPages + " 页 · 共 " + _dropIndices.Count + " 关",
+                        352, 206, Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
+                    Text(g, "点一条即选定", 626, 206, Resources.FONT_BRIANNETOD12,
+                        new SexyColor(150, 160, 150), DrawStringJustification.Right);
                 }
 
-                // 区块二：手动加入（标题独占一行，输入框/端口/按钮在下一行，互不重叠）
-                TodCommon.TodDrawString(g, "手动加入（填对方 IP 和端口）：", 165, 342, Resources.FONT_BRIANNETOD16,
-                    new SexyColor(220, 220, 220), DrawStringJustification.Left);
-                TodCommon.TodDrawString(g, "/", 413, 380, Resources.FONT_BRIANNETOD12,
-                    new SexyColor(150, 150, 160), DrawStringJustification.Center);
+                DrawHits(g);
 
-                // 帮助文字（小字号，两行防溢出）
-                TodCommon.TodDrawString(g, "搜不到房间？Windows 防火墙允许『专用+公用』（热点属公用）",
-                    500, 492, Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
-                TodCommon.TodDrawString(g, "跨互联网请双方用虚拟局域网工具后填虚拟网 IP",
-                    500, 512, Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+                string status = Sync.Session.StatusText;
+                if (!string.IsNullOrEmpty(status))
+                {
+                    Text(g, status, 400, 462, Resources.FONT_BRIANNETOD16,
+                        Sync.Session.StatusIsError ? new SexyColor(255, 120, 100) : new SexyColor(160, 255, 160),
+                        DrawStringJustification.Center);
+                }
+                Text(g, "协议 v" + Protocol.ProtocolVersion.Current, mWidth - 12, mHeight - 22,
+                    Resources.FONT_BRIANNETOD12, new SexyColor(120, 130, 120, 200), DrawStringJustification.Right);
             }
-            else
+            catch (Exception ex)
             {
-                bool connected = Sync.Session.Net.IsConnected;
-                // 主机等待期间：15 秒没收到任何局域网搜索请求 → 大概率是防火墙挡了
-                if (Sync.Session.IsHost && connected && (Sync.Session.DiscoveryReqAge < 0 || Sync.Session.DiscoveryReqAge > 15))
+                Core.ModEnv.LogOnce("联机页绘制异常（重复不再记）: " + ex.Message);
+            }
+        }
+
+        private void DrawLobby(Graphics g)
+        {
+            Text(g, "你的昵称:", 160, 58, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
+            Text(g, "局域网房间（点一条加入）", 160, 100, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
+            if (Sync.Session.RoomList.Count == 0)
+            {
+                Text(g, "正在搜索…（对方点[建立房间]后几秒内出现）", 400, 130,
+                    Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+            }
+            Text(g, "手动加入（填对方 IP 和端口）", 160, 284, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
+            Text(g, "搜不到房间？Windows 防火墙允许『专用+公用』（手机热点属公用）", 400, 404,
+                Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+            Text(g, "跨互联网：双方先连同一个虚拟局域网（ZeroTier/Tailscale），再填虚拟网 IP", 400, 420,
+                Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+        }
+
+        private static void Text(Graphics g, string s, int x, int y, Font font, SexyColor color,
+            DrawStringJustification just = DrawStringJustification.Left)
+        {
+            TodCommon.TodDrawString(g, s, x, y, font, color, just);
+        }
+
+        private void DrawHits(Graphics g)
+        {
+            var font16 = Resources.FONT_BRIANNETOD16;
+            var font12 = Resources.FONT_BRIANNETOD12;
+            foreach (var h in _hits)
+            {
+                switch (h.Kind)
                 {
-                    TodCommon.TodDrawString(g, "对方一直搜不到本机？Windows 防火墙允许『专用网络+公用网络』，或把热点网络设为专用",
-                        500, 205, Resources.FONT_BRIANNETOD16, new SexyColor(255, 200, 120), DrawStringJustification.Center);
+                    case HitKind.Info:
+                        g.SetFont(font12);
+                        g.SetColor(new SexyColor(170, 180, 170));
+                        g.DrawString(h.Main, h.X, h.Y);
+                        break;
+
+                    case HitKind.Seat:
+                        DrawSeat(g, h, font16, font12);
+                        break;
+
+                    case HitKind.RoomRow:
+                        Bar(g, h, new SexyColor(52, 58, 46, 215), new SexyColor(150, 214, 255, 190));
+                        g.SetFont(font16);
+                        g.SetColor(new SexyColor(235, 235, 225));
+                        g.DrawString(h.Main, h.X + 10, h.Y + 9);
+                        break;
+
+                    case HitKind.Kick:
+                        Centered(g, h, font12, new SexyColor(74, 44, 40, 220),
+                            new SexyColor(255, 150, 130, 170), new SexyColor(255, 200, 180));
+                        break;
+
+                    case HitKind.Tab:
+                        Centered(g, h, font12,
+                            h.Selected ? new SexyColor(96, 112, 74, 235) : new SexyColor(44, 50, 40, 215),
+                            h.Selected ? new SexyColor(215, 248, 180, 235) : new SexyColor(130, 145, 125, 170),
+                            h.Selected ? new SexyColor(255, 244, 180) : new SexyColor(205, 210, 200));
+                        break;
+
+                    case HitKind.LevelRow:
+                        Bar(g, h, h.Selected ? new SexyColor(64, 84, 52, 235) : new SexyColor(38, 42, 34, 215),
+                            h.Selected ? new SexyColor(215, 248, 180, 235) : new SexyColor(120, 132, 116, 160));
+                        g.SetFont(font16);
+                        g.SetColor(h.Selected ? new SexyColor(170, 235, 150) : new SexyColor(150, 160, 150));
+                        g.DrawString(h.Selected ? "*" : "-", h.X + 8, h.Y + 5);
+                        g.SetColor(new SexyColor(232, 234, 226));
+                        g.DrawString(h.Main, h.X + 26, h.Y + 5);
+                        break;
+
+                    case HitKind.Pager:
+                        Centered(g, h, font12, new SexyColor(44, 50, 40, 215),
+                            new SexyColor(150, 214, 255, 170), new SexyColor(225, 232, 220));
+                        break;
                 }
-                // 玩家列表（4 行，44px 行距，含准备状态）
-                int rowY = 60;
-                for (int ps = 0; ps < Sync.Session.MaxPlayers; ps++)
+            }
+        }
+
+        private static void Bar(Graphics g, Hit h, SexyColor fill, SexyColor edge)
+        {
+            g.SetColor(fill);
+            g.FillRect(h.X, h.Y, h.W, h.H);
+            g.SetColor(edge);
+            g.DrawRect(h.X, h.Y, h.W, h.H);
+        }
+
+        private static void Centered(Graphics g, Hit h, Font font, SexyColor fill, SexyColor edge, SexyColor text)
+        {
+            Bar(g, h, fill, edge);
+            g.SetFont(font);
+            g.SetColor(text);
+            g.DrawString(h.Main, h.X + (h.W - font.StringWidth(h.Main)) / 2, h.Y + (h.H - 12) / 2 + 1);
+        }
+
+        private void DrawSeat(Graphics g, Hit h, Font font16, Font font12)
+        {
+            string seat = h.Left ?? "";
+            Bar(g, h, new SexyColor(90, 96, 84, 150),
+                h.Selected ? new SexyColor(255, 235, 150, 200) : new SexyColor(120, 130, 115, 120));
+            g.SetFont(font12);
+            g.SetColor(seat == "主机位" ? new SexyColor(255, 224, 130) : new SexyColor(150, 214, 255));
+            g.DrawString(seat, h.X + 10, h.Y + 12);
+            g.SetFont(font16);
+            g.SetColor(new SexyColor(240, 240, 240));
+            g.DrawString(h.Main, h.X + 10 + (int)font12.StringWidth(seat) + 14, h.Y + 9);
+            if (string.IsNullOrEmpty(h.Right))
+            {
+                return;
+            }
+            g.SetColor(h.Right == "房主" ? new SexyColor(255, 224, 130)
+                : h.Right.Contains("已准备") ? new SexyColor(160, 255, 160)
+                : new SexyColor(255, 190, 120));
+            g.DrawString(h.Right, h.X + h.W - 12 - (int)font16.StringWidth(h.Right), h.Y + 9);
+        }
+
+        // ------------------------------------------------------------ 自绘条目的点击命中
+
+        public override void MouseDown(int x, int y, int theBtnNum, int theClickCount)
+        {
+            try
+            {
+                for (int i = _hits.Count - 1; i >= 0; i--)
                 {
-                    bool occupied = ps == 0 || Sync.Session.SlotOccupied[ps];
-                    string tag = ps == 0 ? "主机" : "客人" + ps;
-                    string nick = Sync.Session.Nicks[ps];
-                    string who = tag + ": " + (occupied && !string.IsNullOrEmpty(nick) ? nick : "（等待加入）");
-                    string state = "";
-                    if (occupied && ps != 0)
+                    var h = _hits[i];
+                    if (h.Id < 0)
                     {
-                        state = Sync.Session.RoomReadyOf(ps) ? "  ✓已准备" : "  （未准备）";
+                        continue; // 纯展示，不拦点击
                     }
-                    g.SetColor(new SexyColor(90, 90, 90, 120));
-                    g.FillRect(160, rowY - 4, 480, 34);
-                    TodCommon.TodDrawString(g, who + state, 172, rowY + 6, Resources.FONT_BRIANNETOD16,
-                        new SexyColor(240, 240, 240), DrawStringJustification.Left);
-                    rowY += 44;
-                }
-                if (!connected)
-                {
-                    TodCommon.TodDrawString(g, "未连接", 500, 240, Resources.FONT_BRIANNETOD16,
-                        new SexyColor(255, 120, 100), DrawStringJustification.Center);
+                    if (x >= h.X && x < h.X + h.W && y >= h.Y && y < h.Y + h.H)
+                    {
+                        try
+                        {
+                            _app.PlaySample(Resources.SOUND_BUTTONCLICK);
+                        }
+                        catch
+                        {
+                        }
+                        ButtonDepress(h.Id);
+                        return;
+                    }
                 }
             }
-
-            string status = Sync.Session.StatusText;
-            if (!string.IsNullOrEmpty(status))
+            catch (Exception ex)
             {
-                TodCommon.TodDrawString(g, status, 500, 462, Resources.FONT_BRIANNETOD16,
-                    Sync.Session.StatusIsError ? new SexyColor(255, 120, 100) : new SexyColor(160, 255, 160),
-                    DrawStringJustification.Center);
+                Core.ModEnv.LogOnce("联机页点击处理异常（重复不再记）: " + ex.Message);
             }
+            base.MouseDown(x, y, theBtnNum, theClickCount);
         }
 
         // ------------------------------------------------------------ 输入保存
@@ -421,6 +733,15 @@ namespace PGvZOnlineMod.Ui
             return Core.ModEnv.GetConfig().HostPort;
         }
 
+        private static string Clip(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length <= max)
+            {
+                return s ?? "";
+            }
+            return s.Substring(0, max) + "…";
+        }
+
         // ------------------------------------------------------------ ButtonListener
 
         public void ButtonDepress(int theId)
@@ -432,76 +753,110 @@ namespace PGvZOnlineMod.Ui
                     Close(_app);
                     _app.mGameScene = GameScenes.Menu;
                     _app.ShowGameSelector();
-                    break;
+                    return;
                 case HostId:
                     SaveIdentity();
                     Sync.Session.StartHosting(_app);
-                    RefreshUi();
                     break;
-                case SaveNickId:
-                {
-                    var cfgN = Core.ModEnv.GetConfig();
-                    string nick = _nickEdit.Text.Trim();
-                    if (string.IsNullOrEmpty(nick))
-                    {
-                        Sync.Session.SetStatus("昵称不能为空", true);
-                        break;
-                    }
-                    cfgN.Nickname = nick;
-                    Core.ModEnv.SaveConfig();
-                    if (Sync.Session.Phase == Sync.SessionPhase.HostingLobby
-                        || Sync.Session.Phase == Sync.SessionPhase.InRoom)
-                    {
-                        if (Sync.Session.IsHost)
-                        {
-                            Sync.Session.Nicks[0] = nick;
-                            Sync.Session.BroadcastRoomState(); // 房间信息里同步新昵称
-                        }
-                        else
-                        {
-                            Sync.Session.Nicks[Sync.Session.MySlot] = nick;
-                        }
-                    }
-                    Sync.Session.SetStatus("昵称已保存并生效：" + nick, false);
-                    break;
-                }
                 case JoinId:
                     SaveIdentity();
                     Sync.Session.StartJoining(_app, _ipEdit.Text, ParsePort());
-                    RefreshUi();
+                    break;
+                case SaveNickId:
+                    SaveNick();
                     break;
                 case LevelId:
-                    Sync.Session.CycleLevel();
+                    _dropPage = 0;
+                    _dropOpen = !_dropOpen;
                     break;
                 case StartId:
                     Sync.Session.HostStartGame(_app);
                     break;
                 case DisconnectId:
+                    _dropOpen = false;
                     Sync.Session.CancelOrDisconnect();
-                    RefreshUi();
                     break;
                 case ReadyBtnId:
                     Sync.Session.SetRoomReady(!Sync.Session.AmRoomReady);
-                    RefreshUi();
+                    break;
+                case LvlPrevId:
+                    _dropPage = (_dropPage + _dropPages - 1) % _dropPages;
+                    break;
+                case LvlNextId:
+                    _dropPage = (_dropPage + 1) % _dropPages;
                     break;
                 default:
-                    if (theId >= KickBtnIdBase && theId < KickBtnIdBase + 3)
-                    {
-                        int kickSlot = theId - KickBtnIdBase + 1;
-                        if (kickSlot < Sync.Session.MaxPlayers && Sync.Session.SlotOccupied[kickSlot])
-                        {
-                            Sync.Session.KickGuest(kickSlot);
-                        }
-                    }
-                    else if (theId >= RoomButtonIdBase && theId < RoomButtonIdBase + RoomButtonCount)
-                    {
-                        int idx = theId - RoomButtonIdBase;
-                        if (idx < Sync.Session.RoomList.Count)
-                        {
-                            Sync.Session.JoinFromDiscovery(Sync.Session.RoomList[idx].Ip);
-                        }
-                    }
+                    HandleOtherButton(theId);
                     break;
+            }
+            RefreshUi();
+        }
+
+        private void SaveNick()
+        {
+            var cfg = Core.ModEnv.GetConfig();
+            string nick = _nickEdit.Text.Trim();
+            if (string.IsNullOrEmpty(nick))
+            {
+                Sync.Session.SetStatus("昵称不能为空", true);
+                return;
+            }
+            cfg.Nickname = nick;
+            Core.ModEnv.SaveConfig();
+            if (Sync.Session.Phase == Sync.SessionPhase.HostingLobby
+                || Sync.Session.Phase == Sync.SessionPhase.InRoom)
+            {
+                if (Sync.Session.IsHost)
+                {
+                    Sync.Session.Nicks[0] = nick;
+                    Sync.Session.BroadcastRoomState(); // 房间信息里同步新昵称
+                }
+                else
+                {
+                    Sync.Session.Nicks[Sync.Session.MySlot] = nick;
+                }
+            }
+            Sync.Session.SetStatus("昵称已保存并生效：" + nick, false);
+        }
+
+        private void HandleOtherButton(int theId)
+        {
+            if (theId >= LvlPageIdBase && theId < LvlPageIdBase + TabCount)
+            {
+                int f = theId - LvlPageIdBase;
+                if (_dropFilters != null && f < _dropFilters.Count)
+                {
+                    _dropFilter = f;
+                    _dropPage = 0;
+                }
+                return;
+            }
+            if (theId >= LvlRowIdBase && theId < LvlRowIdBase + RowCount)
+            {
+                int k = _dropPage * RowCount + (theId - LvlRowIdBase);
+                if (k < _dropIndices.Count)
+                {
+                    Sync.Session.HostSetLevel(_dropIndices[k]);
+                    _dropOpen = false;
+                }
+                return;
+            }
+            if (theId >= KickBtnIdBase && theId < KickBtnIdBase + Sync.Session.MaxPlayers)
+            {
+                int kickSlot = theId - KickBtnIdBase + 1;
+                if (kickSlot < Sync.Session.MaxPlayers && Sync.Session.SlotOccupied[kickSlot])
+                {
+                    Sync.Session.KickGuest(kickSlot);
+                }
+                return;
+            }
+            if (theId >= RoomButtonIdBase && theId < RoomButtonIdBase + RoomButtonCount)
+            {
+                int idx = theId - RoomButtonIdBase;
+                if (idx < Sync.Session.RoomList.Count)
+                {
+                    Sync.Session.JoinFromDiscovery(Sync.Session.RoomList[idx].Ip);
+                }
             }
         }
 
@@ -551,13 +906,7 @@ namespace PGvZOnlineMod.Ui
             RemoveWidget(_nickEdit);
             RemoveWidget(_saveNickBtn);
             RemoveWidget(_readyBtn);
-            for (int i = 0; i < _kickBtns.Length; i++)
-            {
-                if (_kickBtns[i] != null)
-                {
-                    RemoveWidget(_kickBtns[i]);
-                }
-            }
+            _hits.Clear();
             base.RemovedFromManager(manager);
         }
     }

@@ -26,7 +26,7 @@ namespace PGvZOnlineMod.Sync
                     return;
                 }
                 if (playerSlot < 0 || playerSlot >= Session.MaxPlayers
-                    || cardSlot < 0 || cardSlot >= Session.MaxPlayers)
+                    || cardSlot < 0 || cardSlot >= Protocol.Packets.MaxSeedSlots)
                 {
                     return;
                 }

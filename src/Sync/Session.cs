@@ -63,6 +63,8 @@ namespace PGvZOnlineMod.Sync
         public static bool AwaitingReady;
         public static bool LevelActuallyStarted;
         private static bool _localReadySent;
+        private static bool _allReadySent;
+        private static int _seedStateSent;
         private static Action _pendingStart;
         private static readonly bool[] _readyFlags = new bool[MaxPlayers];
 
@@ -102,15 +104,294 @@ namespace PGvZOnlineMod.Sync
         public static string StatusText = "";
         public static bool StatusIsError;
 
-        // ---- 关卡表（GameMode 自带阶段信息，客户端可直接 PreNewGame）
-        public static readonly (GameMode Mode, string Label)[] Levels =
+        // ---- 联机关卡表：直接取游戏自己的关卡定义 ChallengeScreen.gChallengeDefs
+        //      （GameMode + 页签 + 名称），与主菜单"生存/挑战"页看到的是同一张表——
+        //      不自造"难度×场景"矩阵，游戏里有哪个 GameMode 就能选哪个。
+        //      握手已强制两端游戏版本一致，所以两端枚举出的顺序必然相同，levelIndex 可直接用。
+
+        public class OnlineLevel
         {
-            (GameMode.SurvivalNormalStage1, "生存 · 白天前院"),
-            (GameMode.SurvivalNormalStage2, "生存 · 黑夜"),
-            (GameMode.SurvivalNormalStage3, "生存 · 泳池"),
-            (GameMode.SurvivalNormalStage4, "生存 · 浓雾"),
-            (GameMode.SurvivalNormalStage5, "生存 · 屋顶"),
+            public GameMode Mode;
+            public string Name;       // 已翻成中文的显示名
+            public string PageLabel;  // 分类：生存 / 挑战 / 挑战2 / 解谜 / 额外
+            public int PageOrder;
+            public int Row, Col;
+            public string FullLabel => PageLabel + " · " + Name;
+        }
+
+        private static OnlineLevel[] _levels;
+
+        /// <summary>联机可选关卡（按页签→行→列排序）。首次访问时从游戏表构建。</summary>
+        public static OnlineLevel[] Levels => _levels ??= BuildLevels();
+
+        private static readonly (ChallengePage Page, string Label)[] PageNames =
+        {
+            (ChallengePage.Survival, "生存"),
+            (ChallengePage.Challenge, "挑战"),
+            (ChallengePage.Challenge2, "挑战2"),
+            (ChallengePage.Puzzle, "解谜"),
+            (ChallengePage.Extra, "额外"),
         };
+
+        private static string PageLabelOf(ChallengePage page)
+        {
+            for (int i = 0; i < PageNames.Length; i++)
+            {
+                if (PageNames[i].Page == page)
+                {
+                    return PageNames[i].Label;
+                }
+            }
+            return page.ToString();
+        }
+
+        private static int PageOrderOf(ChallengePage page)
+        {
+            for (int i = 0; i < PageNames.Length; i++)
+            {
+                if (PageNames[i].Page == page)
+                {
+                    return i;
+                }
+            }
+            return int.MaxValue;
+        }
+
+        /// <summary>
+        /// 能不能联机打这一关，两条判据都要满足：
+        /// ① 出怪可控——通用波次走 SpawnZombieWave（已钩），模式专用出怪走
+        ///    Challenge.UpdateZombieSpawning（客户端已被总闸整体跳过），
+        ///    所以"特殊出怪"不再是拒绝理由；
+        /// ② 玩家输入只有"种植 / 铲除"——本模组只转发这两种请求。
+        ///    老虎机（点机器换卡）、天降种子（接飘落卡）、宝石迷阵（拖拽换牌）、
+        ///    敲僵尸（锤子）、砸罐子（开罐）需要额外的输入转发，暂不开放。
+        /// 冒险模式另说：它是 (GameMode, 关卡号) 二元组，光给 GameMode 起不了关。
+        /// </summary>
+        private static bool IsOnlinePlayable(ChallengeDefinition def)
+        {
+            if (def == null)
+            {
+                return false;
+            }
+            GameMode m = def.mChallengeMode;
+            bool survival = (m >= GameMode.SurvivalNormalStage1 && m <= GameMode.SurvivalEndlessStage5)
+                || (m >= GameMode.SurvivalHellStage1 && m <= GameMode.SurvivalHellStage5)
+                || (m >= GameMode.BigPoolSurvivalNormalStage && m <= GameMode.BigPoolSurvivalHellStage);
+            return survival || OnlineMiniGames.Contains(m);
+        }
+
+        /// <summary>
+        /// MiniGameStart(16)..MiniGameCount(20) 里输入模型兼容的子集，外加僵尸博士两关。
+        /// 18 老虎机 / 19 天降种子 / 20 宝石迷阵 因需要额外输入转发而暂缺。
+        /// </summary>
+        private static readonly HashSet<GameMode> OnlineMiniGames = new HashSet<GameMode>
+        {
+            GameMode.ChallengeWarAndPeas,      // 16 豌豆大战僵尸：纯种植守家
+            GameMode.ChallengeWallnutBowling,  // 17 坚果保龄球：点赛道走的就是种植光标
+            GameMode.ChallengeFinalBoss,       // 34 僵尸博士：普通种植，Boss 造僵尸归出怪总闸管
+            GameMode.ChallengeFinalBoss2,      // 131 僵尸博士的复仇2：同上
+        };
+
+        private static OnlineLevel[] BuildLevels()
+        {
+            var list = new List<OnlineLevel>();
+            try
+            {
+                foreach (var def in ChallengeScreen.gChallengeDefs)
+                {
+                    if (!IsOnlinePlayable(def))
+                    {
+                        continue;
+                    }
+                    string name = TranslateGameString(def.mChallengeName);
+                    string family = SurvivalFamilyOf(def.mChallengeMode);
+                    list.Add(new OnlineLevel
+                    {
+                        Mode = def.mChallengeMode,
+                        Name = family.Length > 0 && !name.Contains(family) ? family + " · " + name : name,
+                        PageLabel = PageLabelOf(def.mPage),
+                        PageOrder = PageOrderOf(def.mPage),
+                        Row = def.mRow,
+                        Col = def.mCol,
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                // 离线验证台（VerifyHost）里没有游戏运行时，拿不到这张表；
+                // 退回生存 18 关，保证关卡语义仍可被断言。
+                ModEnv.Log("读取游戏关卡表失败，退回生存关: " + ex.Message);
+                list.Clear();
+            }
+            if (list.Count == 0)
+            {
+                foreach (var m in FallbackSurvivalModes())
+                {
+                    list.Add(m);
+                }
+            }
+            // 排序按"页签 → GameMode 数值"：游戏表里的行/列是给九宫格摆位用的，
+            // 大泳池那几条是负数行列，按行列排会把它们顶到最前面（实测就是这毛病）。
+            list.Sort((a, b) =>
+            {
+                int c = a.PageOrder.CompareTo(b.PageOrder);
+                if (c != 0)
+                {
+                    return c;
+                }
+                return ((int)a.Mode).CompareTo((int)b.Mode);
+            });
+            return list.ToArray();
+        }
+
+        private static IEnumerable<OnlineLevel> FallbackSurvivalModes()
+        {
+            string[] scenes = { "白天前院", "黑夜", "泳池", "浓雾", "屋顶" };
+            var families = new (GameMode Base, string Family)[]
+            {
+                (GameMode.SurvivalNormalStage1, "普通"),
+                (GameMode.SurvivalHardStage1, "困难"),
+                (GameMode.SurvivalEndlessStage1, "无尽"),
+                (GameMode.SurvivalHellStage1, "地狱"),
+            };
+            foreach (var f in families)
+            {
+                for (int s = 0; s < scenes.Length; s++)
+                {
+                    yield return new OnlineLevel
+                    {
+                        Mode = f.Base + s,
+                        Name = f.Family + " · " + scenes[s],
+                        PageLabel = "生存",
+                        PageOrder = 0,
+                        Row = Array.IndexOf(families, f),
+                        Col = s,
+                    };
+                }
+            }
+        }
+
+        // TodStringFile 是 internal，翻译只能反射（与联机页反射 LawnCommon.DrawImageBox 同一家族的做法）
+        private delegate string TranslateDelegate(string key);
+
+        private static readonly TranslateDelegate s_translate = ResolveTranslate();
+
+        private static TranslateDelegate ResolveTranslate()
+        {
+            try
+            {
+                var type = typeof(LawnApp).Assembly.GetType("Sexy.TodLib.TodStringFile");
+                var m = type?.GetMethod("TodStringTranslate",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public
+                    | System.Reflection.BindingFlags.NonPublic,
+                    null, new[] { typeof(string) }, null);
+                return m == null ? null : (TranslateDelegate)Delegate.CreateDelegate(typeof(TranslateDelegate), m);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string TranslateGameString(string key)
+        {
+            if (string.IsNullOrEmpty(key))
+            {
+                return "未命名";
+            }
+            string trimmed = key.Trim('[', ']');
+            try
+            {
+                if (s_translate == null)
+                {
+                    return trimmed;
+                }
+                var v = s_translate(key);
+                // 游戏找不到该串时会返回 "<Missing XXX>"，别把它甩给玩家看
+                if (string.IsNullOrEmpty(v) || v.Contains("<Missing"))
+                {
+                    return trimmed;
+                }
+                return v;
+            }
+            catch
+            {
+                return trimmed;
+            }
+        }
+
+        /// <summary>按 GameMode 给一句结束条件说明（无尽没有通关判定，UI 要提前讲清）。</summary>
+        public static string LevelRuleHint(GameMode mode)
+        {
+            if (mode >= GameMode.SurvivalEndlessStage1 && mode <= GameMode.SurvivalEndlessStage5)
+            {
+                return "生存无尽：没有通关判定，打到阵亡或主动退出为止";
+            }
+            if (mode >= GameMode.SurvivalHardStage1 && mode <= GameMode.SurvivalHardStage5)
+            {
+                return "生存困难：每旗 20 波、共 10 旗";
+            }
+            if (mode >= GameMode.SurvivalHellStage1 && mode <= GameMode.SurvivalHellStage5)
+            {
+                return "生存地狱：5 个阶段，僵尸种类与掉落另算";
+            }
+            if (mode >= GameMode.SurvivalNormalStage1 && mode <= GameMode.SurvivalNormalStage5)
+            {
+                return "生存普通：每旗 10 波、共 10 旗";
+            }
+            if (OnlineMiniGames.Contains(mode))
+            {
+                return "小游戏/Boss：出怪与僵尸全由主机驱动，种植与铲除同步";
+            }
+            return "目标与单人打这一关一致：过关即整局胜利";
+        }
+
+        /// <summary>
+        /// 生存族前缀：游戏自己的串只到"白天/黑夜/泳池"这一层，
+        /// 难度是靠页面上的行位置区分的，列表里必须自己补上才不会四个"白天"撞名。
+        /// 区间取自 GameMode 枚举定义（普通1-5 / 困难6-10 / 无尽11-15 / 地狱136-140）。
+        /// </summary>
+        public static string SurvivalFamilyOf(GameMode m)
+        {
+            if (m >= GameMode.SurvivalNormalStage1 && m <= GameMode.SurvivalNormalStage5) return "普通";
+            if (m >= GameMode.SurvivalHardStage1 && m <= GameMode.SurvivalHardStage5) return "困难";
+            if (m >= GameMode.SurvivalEndlessStage1 && m <= GameMode.SurvivalEndlessStage5) return "无尽";
+            if (m >= GameMode.SurvivalHellStage1 && m <= GameMode.SurvivalHellStage5) return "地狱";
+            return "";
+        }
+
+        public static int ClampLevelIndex(int index)
+        {
+            return Math.Clamp(index, 0, Levels.Length - 1);
+        }
+
+        /// <summary>表里实际出现的分类名（按排序顺序），下拉的分类行用它。</summary>
+        public static List<string> LevelPageFilters()
+        {
+            var outList = new List<string> { "全部" };
+            foreach (var lv in Levels)
+            {
+                if (!outList.Contains(lv.PageLabel))
+                {
+                    outList.Add(lv.PageLabel);
+                }
+            }
+            return outList;
+        }
+
+        /// <summary>某分类下的关卡下标（pageLabel 为"全部"或空＝不过滤）。</summary>
+        public static List<int> LevelIndicesOfPage(string pageLabel)
+        {
+            var idx = new List<int>();
+            for (int i = 0; i < Levels.Length; i++)
+            {
+                if (string.IsNullOrEmpty(pageLabel) || pageLabel == "全部" || Levels[i].PageLabel == pageLabel)
+                {
+                    idx.Add(i);
+                }
+            }
+            return idx;
+        }
 
         // ---- 局域网房间发现
         public class DiscoveredRoom
@@ -245,6 +526,12 @@ namespace PGvZOnlineMod.Sync
                 return;
             }
             Nicks[0] = cfg.Nickname;
+            // 主机自己的座位必须算占用：漏了它会导致
+            // ① 主机点完选卡就以为"全员就绪"（AllPlayersReady 看不见主机自己），
+            //    客人被 AllReady 放进战场而主机还停在选卡界面；
+            // ② HUD 人数少算一个；③ 主机自己暂停意愿被忽略；④ 按人数加压数不到主机。
+            SlotOccupied[0] = true;
+            _readyFlags[0] = false;
             for (int i = 1; i < MaxPlayers; i++)
             {
                 Nicks[i] = "";
@@ -277,6 +564,7 @@ namespace PGvZOnlineMod.Sync
                 return;
             }
             Nicks[0] = "";
+            SlotOccupied[0] = false; // 主机位由 RoomState 置回；避免"先建房后加入"时残留
             Nicks[MySlot] = cfg.Nickname;
             for (int i = 1; i < MaxPlayers; i++)
             {
@@ -315,13 +603,24 @@ namespace PGvZOnlineMod.Sync
             SetStatus("", false);
         }
 
-        public static void CycleLevel()
+        /// <summary>
+        /// 主机改选关（难度 + 场景两维直选，比循环点按快得多）；
+        /// 立即广播 RoomState，客人那边只是同步显示，不能改。
+        /// </summary>
+        /// <summary>主机改选关（下拉里点某一项）；立即广播 RoomState，客人只同步显示、不能改。</summary>
+        public static void HostSetLevel(int levelIndex)
         {
-            if (!IsHost)
+            if (!IsHost || InGame)
             {
                 return;
             }
-            SelectedLevelIndex = (SelectedLevelIndex + 1) % Levels.Length;
+            int idx = ClampLevelIndex(levelIndex);
+            if (SelectedLevelIndex == idx)
+            {
+                return;
+            }
+            SelectedLevelIndex = idx;
+            ModEnv.Log("主机改选关: " + Levels[idx].FullLabel + " (GameMode=" + (int)Levels[idx].Mode + ")");
             BroadcastRoomState();
         }
 
@@ -340,7 +639,7 @@ namespace PGvZOnlineMod.Sync
                     return;
                 }
             }
-            var mode = Levels[Math.Clamp(SelectedLevelIndex, 0, Levels.Length - 1)].Mode;
+            var mode = Levels[ClampLevelIndex(SelectedLevelIndex)].Mode;
             int seed = Environment.TickCount & 0x7fffffff;
             var m = Net.CreateMessage();
             if (m != null)
@@ -363,7 +662,9 @@ namespace PGvZOnlineMod.Sync
             ResetReadyGate();
             OnlineLobbyScreen.CloseIfOpen(app);
             SetStatus("", false);
-            ModEnv.Log("开局: " + mode);
+            // 带数值：GameMode 存在同值别名（ChallengeStart == SurvivalNormalStage1 == 1），
+            // 只打枚举名会把"生存·白天前院"显示成"ChallengeStart"
+            ModEnv.Log("开局: " + mode + " (GameMode=" + (int)mode + ")");
             app.PreNewGame(mode, false);
         }
 
@@ -374,6 +675,8 @@ namespace PGvZOnlineMod.Sync
             AwaitingReady = false;
             LevelActuallyStarted = false;
             _localReadySent = false;
+            _allReadySent = false;
+            _seedStateSent = 0;
             _pendingStart = null;
             for (int s = 0; s < MaxPlayers; s++)
             {
@@ -416,8 +719,11 @@ namespace PGvZOnlineMod.Sync
             if (!_localReadySent)
             {
                 _localReadySent = true;
+                _readyFlags[IsHost ? 0 : MySlot] = true; // 本方就绪要自己记账（主机自己不会收到自己的包）
                 SendReady(deckTypes, deckImitaters);
             }
+            TryReleaseAllReady(); // 主机也可能是最后一个选完的，这条路同样要广播 AllReady
+            BroadcastSeedState();
             return AllPlayersReady();
         }
 
@@ -454,9 +760,26 @@ namespace PGvZOnlineMod.Sync
             }
             if (!AllPlayersReady())
             {
+                BroadcastSeedState(); // 还没齐：先把"谁选完了"推给所有客人，界面上能看到进度
                 return;
             }
-            // 全员就绪：主机放行自己的门闩，并广播 AllReady 让各客户端放行
+            BroadcastSeedState();
+            TryReleaseAllReady();
+        }
+
+        /// <summary>
+        /// 主机侧统一放行：集齐在场所有人的就绪后放自己的门闩并广播 AllReady。
+        /// 必须同时挂在"收到客人 Ready"和"主机自己点完选卡"两条路径上——
+        /// 只挂在收包路径上，会出现"客人先选完、主机最后选完"时没人广播，
+        /// 客人永远卡在选卡界面（2026-09-26 实机就是这个现象）。
+        /// </summary>
+        private static void TryReleaseAllReady()
+        {
+            if (!IsHost || _allReadySent || !AllPlayersReady())
+            {
+                return;
+            }
+            _allReadySent = true;
             LevelActuallyStarted = true;
             SetStatus("全员就绪，进入关卡", false);
             if (AwaitingReady && _pendingStart != null)
@@ -472,6 +795,58 @@ namespace PGvZOnlineMod.Sync
                 Packets.WriteAllReady(m);
                 Net.SendReliableToClients(m);
             }
+        }
+
+        /// <summary>某槽位的选卡是否已完成（含自己）——选卡界面按人显示状态用。</summary>
+        public static bool SeedReadyOf(int slot)
+        {
+            return slot >= 0 && slot < MaxPlayers && _readyFlags[slot];
+        }
+
+        /// <summary>
+        /// 主机把全员选卡状态广播出去（客人自己算不出别人的进度）。
+        /// 位图没变化就不发；_seedStateSent 随 ResetReadyGate 复位。
+        /// </summary>
+        private static void BroadcastSeedState()
+        {
+            if (!IsHost || !Net.IsConnected)
+            {
+                return;
+            }
+            int mask = 0;
+            for (int s = 0; s < MaxPlayers; s++)
+            {
+                if (_readyFlags[s])
+                {
+                    mask |= 1 << s;
+                }
+            }
+            if (mask == _seedStateSent)
+            {
+                return;
+            }
+            _seedStateSent = mask;
+            var m = Net.CreateMessage();
+            if (m == null)
+            {
+                return;
+            }
+            Packets.WriteSeedState(m, mask);
+            Net.SendReliableToClients(m);
+        }
+
+        /// <summary>Client：合并主机发来的选卡状态位图（自己那一位由本地记账，不覆盖）。</summary>
+        private static void ApplySeedState(int mask)
+        {
+            for (int s = 0; s < MaxPlayers; s++)
+            {
+                if (s == MySlot)
+                {
+                    continue;
+                }
+                _readyFlags[s] = (mask & (1 << s)) != 0;
+            }
+            ModEnv.Log("收到选卡状态：位图 " + Convert.ToString(mask, 2).PadLeft(MaxPlayers, '0'));
         }
 
         private static void SendReady(int[] deckTypes, int[] deckImitaters)
@@ -521,6 +896,7 @@ namespace PGvZOnlineMod.Sync
             }
 
             OnlineLobbyScreen.EnsureMenuButton(app);
+            Ui.ChatWidget.Sync(app);
             Hud.RefreshStatusCache();
 
             if (SyncActive && CurrentBoard != null)
@@ -553,19 +929,25 @@ namespace PGvZOnlineMod.Sync
                 _pauseWanted[slot] = paused;
                 ModEnv.Log("本方" + (paused ? "暂停" : "恢复"));
             }
-            if (!IsHost)
+            var req = Net.CreateMessage();
+            if (req != null)
             {
-                var m = Net.CreateMessage();
-                if (m != null)
+                Packets.WritePauseRequest(req, slot, paused);
+                if (IsHost)
                 {
-                    Packets.WritePauseRequest(m, paused);
-                    Net.SendReliableToHost(m);
+                    // 主机是裁决者：自己的暂停意愿也必须发出去，
+                    // 否则客人永远看不到"有人按了暂停"（实机就是这样不同步的）
+                    Net.SendReliableToClients(req);
+                }
+                else
+                {
+                    Net.SendReliableToHost(req);
                 }
             }
             ApplyPauseSync(board, "有玩家未恢复，游戏保持暂停");
         }
 
-        /// <summary>Host：收到某槽位客户端的暂停/恢复请求。</summary>
+        /// <summary>Host：收到某槽位客户端的暂停/恢复请求 → 本地裁决后转发给其余客人。</summary>
         private static void OnRemotePauseRequest(int slot, bool paused)
         {
             var board = CurrentBoard;
@@ -581,6 +963,29 @@ namespace PGvZOnlineMod.Sync
                 {
                     SetStatus("玩家 [" + (Nicks[slot].Length > 0 ? Nicks[slot] : "P" + (slot + 1)) + "] 已暂停", false);
                 }
+            }
+            ApplyPauseSync(board, "有玩家未恢复，游戏保持暂停");
+            // 三人群里客人之间看不到彼此的暂停：由主机把这一格的意愿原样转给其余客人
+            var relay = Net.CreateMessage();
+            if (relay != null)
+            {
+                Packets.WritePauseRequest(relay, slot, paused);
+                Net.SendReliableToClients(relay);
+            }
+        }
+
+        /// <summary>Client：收到某槽位的暂停/恢复（主机裁决后转发过来的）。</summary>
+        private static void OnPauseStateFromHost(int slot, bool paused)
+        {
+            var board = CurrentBoard;
+            if (board == null || !InGame || slot < 0 || slot >= MaxPlayers || slot == MySlot)
+            {
+                return;
+            }
+            if (_pauseWanted[slot] != paused)
+            {
+                _pauseWanted[slot] = paused;
+                ModEnv.Log("槽位 " + slot + (paused ? " 暂停" : " 恢复"));
             }
             ApplyPauseSync(board, "有玩家未恢复，游戏保持暂停");
         }
@@ -886,9 +1291,7 @@ namespace PGvZOnlineMod.Sync
                 var m = Net.CreateMessage();
                 if (m != null)
                 {
-                    m.Write((byte)PacketType.RakePlaced);
-                    m.Write(gridX);
-                    m.Write(gridY);
+                    Packets.WriteRakePlaced(m, gridX, gridY);
                     Net.SendReliableToClients(m);
                     ModEnv.Log("[钉耙] 主机放置 (" + gridX + "," + gridY + ")");
                 }
@@ -1013,6 +1416,46 @@ namespace PGvZOnlineMod.Sync
             SweepDeadObjects();
         }
 
+        // ============================================================ 按人数加压（主机权威）
+
+        /// <summary>在场玩家数（含主机）；槽位占用即计入。</summary>
+        public static int LivePlayerCount()
+        {
+            int n = 0;
+            for (int s = 0; s < MaxPlayers; s++)
+            {
+                if (SlotOccupied[s])
+                {
+                    n++;
+                }
+            }
+            return n;
+        }
+
+        /// <summary>
+        /// 主机生成僵尸时按在场人数放大体血，上限同乘——断头/断臂/伤害帧/巨人扔小鬼
+        /// 都是按比例判定的，只放大当前值会让这些阈值错位。
+        /// 护具（头盔/盾牌/飞行）不放大：它们的耐久本就不进协议，各端各自模拟，
+        /// 只给主机加会让两端差得更远。
+        /// 只作用于主机：客户端的镜像僵尸由 SpawnBatch 的 Hp/MaxHp 落值，不会二次放大。
+        /// </summary>
+        public static void BoostHostZombie(Zombie z, int fromWave)
+        {
+            if (z == null || !IsHost || !SyncActive || fromWave == GameConstants.ZOMBIE_WAVE_CUTSCENE)
+            {
+                return;
+            }
+            float step = ModEnv.GetConfig().ZombieHpPerExtraPlayer;
+            int players = LivePlayerCount();
+            if (step <= 0f || players < 2)
+            {
+                return;
+            }
+            float mult = 1f + (players - 1) * step;
+            z.mBodyHealth = (int)(z.mBodyHealth * mult);
+            z.mBodyMaxHealth = (int)(z.mBodyMaxHealth * mult);
+        }
+
         private static void SweepDeadObjects()
         {
             // id → object 侧走一遍：死亡即解除注册（数量 = 当前实体数，几十级，开销可忽略）
@@ -1106,6 +1549,7 @@ namespace PGvZOnlineMod.Sync
                         X = z.mPosX,
                         Y = z.mPosY,
                         Hp = z.mBodyHealth,
+                        MaxHp = z.mBodyMaxHealth,
                     });
                 }
                 _zombieStates.Add(new NetZombieState { NetId = id, X = z.mPosX, Y = z.mPosY, Row = z.mRow, Hp = z.mBodyHealth });
@@ -1296,6 +1740,11 @@ namespace PGvZOnlineMod.Sync
                             z.mPosX = s.X;
                             z.mPosY = s.Y;
                             z.mBodyHealth = s.Hp;
+                            // 上限也要落：主机加压后按比例判定的断头/伤害帧/扔小鬼才对得上
+                            if (s.MaxHp > 0)
+                            {
+                                z.mBodyMaxHealth = s.MaxHp;
+                            }
                             Registry.Register(s.NetId, z);
                             _objectIds.Add(s.NetId);
                             okZombies++;
@@ -1652,18 +2101,22 @@ namespace PGvZOnlineMod.Sync
 
                 case PacketType.PauseRequest:
                 {
-                    bool paused = Packets.ReadPauseRequest(im);
+                    Packets.ReadPauseRequest(im, out int pSlot, out bool paused);
                     if (IsHost)
                     {
+                        // 主机侧槽位以连接为准（不采信客人自报的 slot）
                         OnRemotePauseRequest(Net.SlotOf(im.SenderConnection), paused);
+                    }
+                    else if (pSlot >= 0 && pSlot < MaxPlayers && pSlot != MySlot)
+                    {
+                        OnPauseStateFromHost(pSlot, paused);
                     }
                     break;
                 }
 
                 case PacketType.RakePlaced:
                 {
-                    int rgx = im.ReadInt32();
-                    int rgy = im.ReadInt32();
+                    Packets.ReadRakePlaced(im, out int rgx, out int rgy);
                     if (!IsHost)
                     {
                         OnRemoteRakePlaced(rgx, rgy);
@@ -1692,6 +2145,16 @@ namespace PGvZOnlineMod.Sync
                         LevelActuallyStarted = true;
                         SetStatus("全员就绪，进入关卡", false);
                         MainThreadQueue.Post(start);
+                    }
+                    break;
+                }
+
+                case PacketType.SeedState:
+                {
+                    int mask = Packets.ReadSeedState(im);
+                    if (!IsHost)
+                    {
+                        ApplySeedState(mask);
                     }
                     break;
                 }
@@ -2215,8 +2678,9 @@ namespace PGvZOnlineMod.Sync
             RoomList.Clear();
             foreach (var room in Rooms.Values)
             {
-                var level = Levels[Math.Clamp(room.LevelIndex, 0, Levels.Length - 1)];
-                room.DisplayText = room.HostNick + " 的房间 — " + level.Label;
+                var level = Levels[ClampLevelIndex(room.LevelIndex)];
+                // 带上 IP：自动搜房失败时，玩家照着这行手填就行
+                room.DisplayText = room.HostNick + " 的房间 — " + level.FullLabel + "  [" + room.Ip + "]";
                 RoomList.Add(room);
             }
             RoomList.Sort((a, b) => b.LastSeen.CompareTo(a.LastSeen));

@@ -59,7 +59,14 @@ namespace PGvZOnlineMod.Ui
         public override void KeyChar(SexyChar theChar)
         {
             char c = theChar.value_type;
-            if (_text.Length >= MaxLength || c < ' ')
+            int code = c;
+            // 软键盘（Android）组词中的退格以 KeyChar code=8 透传，不走 KeyCode.Back
+            if (code == 8 || code == 127)
+            {
+                DeleteLast();
+                return;
+            }
+            if (_text.Length >= MaxLength || code < 32)
             {
                 return;
             }
@@ -76,13 +83,18 @@ namespace PGvZOnlineMod.Ui
         {
             if (theKey == KeyCode.Back)
             {
-                if (_text.Length > 0)
-                {
-                    _text = _text.Substring(0, _text.Length - 1);
-                }
-                ResetBlink();
-                MarkDirty();
+                DeleteLast();
             }
+        }
+
+        private void DeleteLast()
+        {
+            if (_text.Length > 0)
+            {
+                _text = _text.Substring(0, _text.Length - 1);
+            }
+            ResetBlink();
+            MarkDirty();
         }
 
         public override void Draw(Graphics g)
