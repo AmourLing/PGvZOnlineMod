@@ -162,9 +162,12 @@ namespace PGvZOnlineMod.Sync
         /// ① 出怪可控——通用波次走 SpawnZombieWave（已钩），模式专用出怪走
         ///    Challenge.UpdateZombieSpawning（客户端已被总闸整体跳过），
         ///    所以"特殊出怪"不再是拒绝理由；
-        /// ② 玩家输入只有"种植 / 铲除"——本模组只转发这两种请求。
-        ///    老虎机（点机器换卡）、天降种子（接飘落卡）、宝石迷阵（拖拽换牌）、
-        ///    敲僵尸（锤子）、砸罐子（开罐）需要额外的输入转发，暂不开放。
+        /// ② 玩家输入只有"种植 / 铲除"——本模组转发三种种植请求：
+        ///    卡槽种植（PlantFromBank）、手里种子包种植（PlantFromUsableCoin）、铲除（Shovel）。
+        ///    敲僵尸（锤子）、砸罐子（开罐）、宝石迷阵（拖拽换牌，它的棋盘就是植物层本身）
+        ///    需要额外的输入转发或与植物同步冲突，暂不开放。
+        /// ③ 过关判定得是共享状态。阳光/卡组各人独立，所以"本地阳光攒够就通关"的
+        ///    18 老虎机不能开——每人会在不同时刻各自通关（详见 OnlineMiniGames 注释）。
         /// 冒险模式另说：它是 (GameMode, 关卡号) 二元组，光给 GameMode 起不了关。
         /// </summary>
         private static bool IsOnlinePlayable(ChallengeDefinition def)
@@ -181,15 +184,21 @@ namespace PGvZOnlineMod.Sync
         }
 
         /// <summary>
-        /// MiniGameStart(16)..MiniGameCount(20) 里输入模型兼容的子集，外加僵尸博士两关。
-        /// 18 老虎机 / 19 天降种子 / 20 宝石迷阵 因需要额外输入转发而暂缺。
+        /// MiniGameStart(16)..MiniGameCount(20) 里可联机的子集，外加僵尸博士两关。
+        /// 19 天降种子的免费种子包走 InputPlantCoin 转发（同一条路也接得住罐子掉出来的包）。
+        /// 两关仍开不了，理由各不相同：
+        /// · 18 老虎机——过关判定是"本地阳光攒满 2000"，而阳光按设计各人独立，
+        ///   于是每人会在不同时刻各自通关；要开得先给这关定一条共享目标，游戏自己没有。
+        /// · 20 宝石迷阵——棋盘就是 mBoard.mPlants 本身，每格宝石都是植物，
+        ///   与"植物层由主机权威广播"直接冲突，要单独做宝石网格同步。
         /// </summary>
         private static readonly HashSet<GameMode> OnlineMiniGames = new HashSet<GameMode>
         {
             GameMode.ChallengeWarAndPeas,      // 16 豌豆大战僵尸：纯种植守家
             GameMode.ChallengeWallnutBowling,  // 17 坚果保龄球：点赛道走的就是种植光标
+            GameMode.ChallengeRainingSeeds,    // 19 天降种子：种子雨由主机排期，各人接自己那份
             GameMode.ChallengeFinalBoss,       // 34 僵尸博士：普通种植，Boss 造僵尸归出怪总闸管
-            GameMode.ChallengeFinalBoss2,      // 131 僵尸博士的复仇2：同上
+            GameMode.ChallengeFinalBoss2,      // 131 僵尸博士的复仇2：同上，种子雨同样走同步排期
         };
 
         private static OnlineLevel[] BuildLevels()
@@ -338,6 +347,10 @@ namespace PGvZOnlineMod.Sync
             if (mode >= GameMode.SurvivalNormalStage1 && mode <= GameMode.SurvivalNormalStage5)
             {
                 return "生存普通：每旗 10 波、共 10 旗";
+            }
+            if (mode == GameMode.ChallengeRainingSeeds)
+            {
+                return "天降种子：照常用卡组守关，天上不断掉免费种子包，各人接各人的那份";
             }
             if (OnlineMiniGames.Contains(mode))
             {
@@ -1164,6 +1177,60 @@ namespace PGvZOnlineMod.Sync
             catch (Exception ex)
             {
                 ModEnv.Log("同步天降阳光异常: " + ex.Message);
+            }
+        }
+
+        // ============================================================ 天降可用种子包同步
+
+        /// <summary>
+        /// Host：模式刚掉下一枚可用种子包（19 天降种子 / 131 僵尸博士2 的种子雨）
+        /// → 广播落点/类型/下一次掉落的倒计时。客户端抑制自己的随机雨，按这里的事件
+        /// 掉"自己那一份"——种子包和阳光一样是各收各的资源，只有"种下去"要主机裁决。
+        /// </summary>
+        public static void OnHostRainSeedPacket(Coin coin, int nextDropCounter)
+        {
+            if (!IsHost || !SyncActive || coin == null)
+            {
+                return;
+            }
+            try
+            {
+                var m = Net.CreateMessage();
+                if (m == null)
+                {
+                    return;
+                }
+                Packets.WriteRainSeedPacket(m, coin.mPosX, (int)coin.mUsableSeedType, nextDropCounter);
+                Net.SendReliableToClients(m);
+                ModEnv.Log("[天降种子] x=" + (int)coin.mPosX + " 类型=" + coin.mUsableSeedType
+                    + " 下次掉落=" + nextDropCounter);
+            }
+            catch (Exception ex)
+            {
+                ModEnv.Log("天降种子事件发送异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>Client：同位置掉一枚同类型的种子包，并把掉落排期对齐主机。</summary>
+        private static void OnRemoteRainSeedPacket(float x, int seedType, int nextDropCounter)
+        {
+            var board = CurrentBoard;
+            if (board == null || !SyncActive || IsHost)
+            {
+                return;
+            }
+            try
+            {
+                board.AddCoin((int)x, 60, CoinType.UsableSeedPacket, CoinMotion.FromSkySlow)
+                    .mUsableSeedType = (SeedType)seedType;
+                if (board.mChallenge != null)
+                {
+                    board.mChallenge.mChallengeStateCounter = nextDropCounter;
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEnv.Log("同步天降种子异常: " + ex.Message);
             }
         }
 
@@ -2047,6 +2114,17 @@ namespace PGvZOnlineMod.Sync
                     break;
                 }
 
+                case PacketType.InputPlantCoin:
+                {
+                    Packets.ReadInputPlantCoin(im, out _, out int seedType, out int imitater, out int gx, out int gy);
+                    var board = CurrentBoard;
+                    if (IsHost && board != null)
+                    {
+                        MainThreadQueue.Post(() => InputExecutor.ExecutePlantCoin(board, seedType, imitater, gx, gy));
+                    }
+                    break;
+                }
+
                 case PacketType.InputShovel:
                 {
                     Packets.ReadInputShovel(im, out _, out int gx, out int gy);
@@ -2075,6 +2153,16 @@ namespace PGvZOnlineMod.Sync
                     if (!IsHost)
                     {
                         OnRemoteSkySun(sx, cType, cd);
+                    }
+                    break;
+                }
+
+                case PacketType.RainSeedPacket:
+                {
+                    Packets.ReadRainSeedPacket(im, out float rx, out int seedType, out int nextCounter);
+                    if (!IsHost)
+                    {
+                        OnRemoteRainSeedPacket(rx, seedType, nextCounter);
                     }
                     break;
                 }
@@ -2336,6 +2424,18 @@ namespace PGvZOnlineMod.Sync
                 return;
             }
             Packets.WriteInputPlant(m, playerSlot, cardSlot, gridX, gridY);
+            Net.SendReliableToHost(m);
+        }
+
+        /// <summary>客户端把"手里的可用种子包"种下去：种子包归自己，落点由主机裁决。</summary>
+        public static void SendPlantCoinRequest(int playerSlot, int seedType, int imitaterType, int gridX, int gridY)
+        {
+            var m = Net.CreateMessage();
+            if (m == null)
+            {
+                return;
+            }
+            Packets.WriteInputPlantCoin(m, playerSlot, seedType, imitaterType, gridX, gridY);
             Net.SendReliableToHost(m);
         }
 

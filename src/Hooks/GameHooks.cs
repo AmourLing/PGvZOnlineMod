@@ -62,6 +62,11 @@ namespace PGvZOnlineMod.Hooks
             HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "UpdateZombieSpawning", Type.EmptyTypes),
                 (Func<Func<Challenge, bool>, Challenge, bool>)ChallengeUpdateZombieSpawningHook);
 
+            // 天降种子雨：Client 抑制本地随机掉落，Host 掉出种子包后广播（落点/卡种/下轮排期）。
+            // 19 天降种子的主循环，也是 131 僵尸博士2 的种子雨来源。
+            HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "UpdateRainingSeeds", Type.EmptyTypes),
+                (Action<Action<Challenge>, Challenge>)ChallengeUpdateRainingSeedsHook);
+
             // 种植：Client 转请求；Host 执行远端输入时直接走 orig
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "MouseUpWithPlant", new[] { typeof(int), typeof(int), typeof(int) }),
                 (Action<Action<Board, int, int, int>, Board, int, int, int>)BoardMouseUpWithPlantHook);
@@ -115,7 +120,7 @@ namespace PGvZOnlineMod.Hooks
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "AddPlant", new[] { typeof(int), typeof(int), typeof(SeedType), typeof(SeedType) }),
                 (Func<Func<Board, int, int, SeedType, SeedType, Plant>, Board, int, int, SeedType, SeedType, Plant>)BoardAddPlantHook);
 
-            ModEnv.Log("联机 Hooks 已注册（21 个，逐个清单见 项目文档.md 第 6 节；" +
+            ModEnv.Log("联机 Hooks 已注册（22 个，逐个清单见 项目文档.md 第 6 节；" +
                        "核心：LawnApp.UpdateFrames 主泵 / CutScene.EndSeedChooser 门闩 / " +
                        "Board.Update·Draw / SpawnZombieWave×2 / MouseUpWithPlant / MouseDownWithTool）");
         }
@@ -315,11 +320,80 @@ namespace PGvZOnlineMod.Hooks
 
         // ------------------------------------------------------------ 种植转发（Client）/ 远端执行（Host）
 
+        /// <summary>
+        /// 种子雨的落点与卡种都是本地随机的，不锁就每人接到的包各不相同，
+        /// 后面"谁种下了什么"根本无法对齐。客户端整段跳过（自己那份由主机事件掉出来），
+        /// 主机掉完后把落点/卡种/下一轮排期广播出去。
+        /// </summary>
+        private static void ChallengeUpdateRainingSeedsHook(Action<Challenge> orig, Challenge self)
+        {
+            if (Session.ClientSuppressionActive)
+            {
+                return;
+            }
+            var board = self?.mBoard;
+            int coinsBefore = board?.mCoins == null ? 0 : board.mCoins.Count;
+            orig(self);
+            if (board == null || !Session.IsHost || !Session.SyncActive)
+            {
+                return;
+            }
+            try
+            {
+                // AddCoin 只往表尾追加，从后往前找第一枚新增的可用种子包
+                for (int i = board.mCoins.Count - 1; i >= coinsBefore; i--)
+                {
+                    var coin = board.mCoins[i];
+                    if (coin != null && !coin.mDead && coin.mType == CoinType.UsableSeedPacket)
+                    {
+                        Session.OnHostRainSeedPacket(coin, self.mChallengeStateCounter);
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEnv.LogOnce("种子雨广播异常（重复不再记）: " + ex.Message);
+            }
+        }
+
         private static void BoardMouseUpWithPlantHook(Action<Board, int, int, int> orig, Board self, int x, int y, int theClickCount)
         {
             if (Session.ExecutingRemoteInput)
             {
                 orig(self, x, y, theClickCount);
+                return;
+            }
+            // 手里拿着"捡来的种子包"（19 天上掉的，以及其他关里掉地的可用种子包）：
+            // 松手放回原地、丢进垃圾桶、以及落到草坪上的种植请求，三条路要分开走——
+            // 前两条纯本地（硬币本来各人一份），只有第三条要主机裁决。
+            if (Session.ClientSuppressionActive
+                && self.mCursorObject != null
+                && self.mCursorObject.mCursorType == CursorType.PlantFromUsableCoin)
+            {
+                int cgx = self.PixelToGridX(x, y);
+                int cgy = self.PixelToGridY(x, y);
+                bool drop = theClickCount < 0 || self.TrashcanHitTest(x, y);
+                if (!drop && cgx >= 0 && cgy >= 0)
+                {
+                    int seedType = (int)self.mCursorObject.mType;
+                    int imitater = (int)self.mCursorObject.mImitaterType;
+                    var held = self.mCursorObject.mCoinID;
+                    self.mCursorObject.mCoinID = null;
+                    self.mCursorObject.mCursorType = CursorType.Normal;
+                    self.mCursorObject.mType = SeedType.None;
+                    try
+                    {
+                        held?.Die(); // 自己这份当场消耗，长出来的植物等主机广播
+                    }
+                    catch
+                    {
+                    }
+                    Session.SendPlantCoinRequest(Session.MySlot, seedType, imitater, cgx, cgy);
+                    Core.ModEnv.Log("[种植] 客户端请求种子包 类型=" + seedType + " 格=" + cgx + "," + cgy);
+                    return;
+                }
+                orig(self, x, y, theClickCount); // 放回原地/进垃圾桶：本地动作，不转发
                 return;
             }
             if (Session.ClientSuppressionActive

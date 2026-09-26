@@ -8,10 +8,11 @@ namespace PGvZOnlineMod.Protocol
     /// 协议版本：字段布局**或字段语义**不兼容时 +1，握手不一致直接拒连。
     /// v12 = 生成清单带血量上限；v13 = 关卡表 5→20；v14 = 关卡表改取游戏的 gChallengeDefs；
     /// v15 = PauseRequest 载荷加槽位（主机的暂停要能广播给客人）+ 新增 SeedState 位图。
+    /// v16 = 天降种子包同步 + 「手里种子包种下去」的输入转发（19 天降种子）。
     /// </summary>
     public static class ProtocolVersion
     {
-        public const int Current = 15;
+        public const int Current = 16;
     }
 
     /// <summary>模组标识哈希：进握手包，两端必须一致（防不同版本逻辑不同步）。</summary>
@@ -66,6 +67,10 @@ namespace PGvZOnlineMod.Protocol
         Kick = 26,
         /// <summary>各槽位选卡就绪位图（主机 → 全员，选卡界面按人显示状态）</summary>
         SeedState = 27,
+        /// <summary>Host 天降了一枚可用种子包（载荷=落点x/种子类型/新模式倒计时），客户端同位置掉自己的一份</summary>
+        RainSeedPacket = 28,
+        /// <summary>客户端把手里捡到的种子包种下去（载荷=槽位/种子类型/变异类型/格坐标）</summary>
+        InputPlantCoin = 29,
     }
 
     // ------------------------------------------------------------ 数据结构（Lawn 无关，离线可测）
@@ -280,6 +285,23 @@ namespace PGvZOnlineMod.Protocol
             newCountdown = m.ReadInt32();
         }
 
+        // ---- 天降可用种子包（19 天降种子 / 131 僵尸博士2 的种子雨）
+
+        public static void WriteRainSeedPacket(NetOutgoingMessage m, float x, int seedType, int nextDropCounter)
+        {
+            m.Write((byte)PacketType.RainSeedPacket);
+            m.Write(x);
+            m.Write(seedType);
+            m.Write(nextDropCounter);
+        }
+
+        public static void ReadRainSeedPacket(NetIncomingMessage m, out float x, out int seedType, out int nextDropCounter)
+        {
+            x = m.ReadFloat();
+            seedType = m.ReadInt32();
+            nextDropCounter = m.ReadInt32();
+        }
+
         // ---- 开场预览僵尸 / 加速倍率
 
         public static void WriteCutsceneZombie(NetOutgoingMessage m, int zombieType, int gridX, int gridY)
@@ -429,6 +451,30 @@ namespace PGvZOnlineMod.Protocol
         {
             playerSlot = m.ReadInt32();
             cardSlot = m.ReadInt32();
+            gridX = m.ReadInt32();
+            gridY = m.ReadInt32();
+        }
+
+        /// <summary>
+        /// 手里种子包（CursorType.PlantFromUsableCoin）的种植请求。
+        /// 与 InputPlant 的区别：这里没有卡槽，携带的是种子类型本身——种子包不属于任何人的卡组，
+        /// 它是天上掉下来的公共事件，落地后归各自所有，只有"种下去"这个动作要主机裁决。
+        /// </summary>
+        public static void WriteInputPlantCoin(NetOutgoingMessage m, int playerSlot, int seedType, int imitaterType, int gridX, int gridY)
+        {
+            m.Write((byte)PacketType.InputPlantCoin);
+            m.Write(playerSlot);
+            m.Write(seedType);
+            m.Write(imitaterType);
+            m.Write(gridX);
+            m.Write(gridY);
+        }
+
+        public static void ReadInputPlantCoin(NetIncomingMessage m, out int playerSlot, out int seedType, out int imitaterType, out int gridX, out int gridY)
+        {
+            playerSlot = m.ReadInt32();
+            seedType = m.ReadInt32();
+            imitaterType = m.ReadInt32();
             gridX = m.ReadInt32();
             gridY = m.ReadInt32();
         }

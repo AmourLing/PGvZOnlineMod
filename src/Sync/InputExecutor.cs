@@ -100,6 +100,73 @@ namespace PGvZOnlineMod.Sync
             }
         }
 
+        /// <summary>
+        /// 远端玩家把捡来的种子包种下去（19 天降种子的雨，以及其他关里掉在地上的可用种子包）。
+        /// 主机这边临时造一枚同类型的"幽灵种子包"挂到光标上，让原生 MouseUpWithPlant 走完
+        /// 自己的落点校验、融合与提示，原生分支收尾时会 Die 掉光标上那枚硬币——死的是幽灵，
+        /// 不是主机自己地上还没捡的那一枚（种子包各收各的，跟阳光一个道理）。
+        /// </summary>
+        public static void ExecutePlantCoin(Board board, int seedType, int imitaterType, int gridX, int gridY)
+        {
+            try
+            {
+                if (board == null || board.mPaused)
+                {
+                    return;
+                }
+                // 只认枚举里真实存在的植物：SeedTypeCount 是游戏自己标的分界，
+                // 66 往后是宝石按钮/老虎机图标/僵尸卡这些"伪种子"，种下去只会出事
+                if (seedType < 0 || seedType >= (int)SeedType.SeedTypeCount
+                    || imitaterType < (int)SeedType.None || imitaterType >= (int)SeedType.SeedTypeCount)
+                {
+                    return;
+                }
+                if (gridX < 0 || gridY < 0 || gridY >= Constants.MAX_GRIDSIZEY)
+                {
+                    return;
+                }
+                var cursor = board.mCursorObject;
+                if (cursor == null)
+                {
+                    return;
+                }
+
+                Session.ExecutingRemoteInput = true;
+                Coin ghost = null;
+                try
+                {
+                    ghost = board.AddCoin(-500, -500, CoinType.UsableSeedPacket, CoinMotion.Coin);
+                    ghost.mUsableSeedType = (SeedType)seedType;
+                    cursor.mCursorType = CursorType.PlantFromUsableCoin;
+                    cursor.mType = (SeedType)seedType;
+                    cursor.mImitaterType = (SeedType)imitaterType;
+                    cursor.mCoinID = ghost;
+                    board.MouseUpWithPlant(
+                        board.GridToPixelX(gridX, gridY), board.GridToPixelY(gridX, gridY), 0);
+                }
+                finally
+                {
+                    // 放不下时原生路径会提前 return，光标仍挂着幽灵硬币；
+                    // 必须先摘光标再 Die——Coin.Die 里有"光标不能正拿着自己"的断言。
+                    if (ghost != null && ReferenceEquals(cursor.mCoinID, ghost))
+                    {
+                        cursor.mCoinID = null;
+                    }
+                    cursor.mCursorType = CursorType.Normal;
+                    cursor.mType = SeedType.None;
+                    if (ghost != null && !ghost.mDead)
+                    {
+                        ghost.Die();
+                    }
+                    Session.ExecutingRemoteInput = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEnv.Log("执行远端种子包种植异常: " + ex);
+            }
+        }
+
         public static void ExecuteShovel(Board board, int gridX, int gridY)
         {
             try

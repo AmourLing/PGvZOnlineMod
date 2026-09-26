@@ -141,17 +141,20 @@ namespace PGvZOnlineVerify
             }
             // 核心不变量：开放表 = 生存族 ∪ 输入模型兼容的小游戏白名单。
             // 出怪已由总闸接管（Challenge.UpdateZombieSpawning 在客户端整体跳过），
-            // 所以拒绝理由只剩"需要额外输入转发"：老虎机/天降种子/宝石迷阵/敲僵尸/砸罐子。
+            // 种植除卡槽外还认"手里捡来的种子包"（InputPlantCoin），于是天降种子进来了；
+            // 剩下的拒绝理由：宝石迷阵（棋盘就是植物层）、敲僵尸、砸罐子、我是僵尸、禅境，
+            // 以及老虎机——它的过关判定读本地阳光，而阳光各人独立，见 Session.OnlineMiniGames。
             var allowedExtra = new HashSet<GameMode>
             {
                 GameMode.ChallengeWarAndPeas, GameMode.ChallengeWallnutBowling,
                 GameMode.ChallengeFinalBoss, GameMode.ChallengeFinalBoss2,
+                GameMode.ChallengeRainingSeeds,
             };
             var mustBeAbsent = new[]
             {
-                GameMode.ChallengeSlotMachine, GameMode.ChallengeRainingSeeds,
-                GameMode.ChallengeBeghouled, GameMode.ChallengeWhackAZombie,
-                GameMode.ScaryPotter1, GameMode.PuzzleIZombie1, GameMode.ChallengeZenGarden,
+                GameMode.ChallengeSlotMachine, GameMode.ChallengeBeghouled,
+                GameMode.ChallengeWhackAZombie, GameMode.ScaryPotter1,
+                GameMode.PuzzleIZombie1, GameMode.ChallengeZenGarden,
             };
             bool whitelistOnly = true, absentOk = true;
             var present = new HashSet<GameMode>();
@@ -176,8 +179,12 @@ namespace PGvZOnlineVerify
                     Console.WriteLine("  不该开放却出现: " + bad);
                 }
             }
+            // 天降种子靠 InputPlantCoin 才能玩：白名单里漏加，上面两条断言都不会红，
+            // 所以这里正面钉一次"这关确实在表里"。
+            bool coinModeOk = present.Contains(GameMode.ChallengeRainingSeeds);
             Check("关卡表：只开放生存族 + 输入兼容的小游戏白名单", whitelistOnly);
-            Check("关卡表：老虎机/天降种子/宝石迷阵/敲僵尸/砸罐子/我是僵尸/禅境均未开放", absentOk);
+            Check("关卡表：老虎机/宝石迷阵/敲僵尸/砸罐子/我是僵尸/禅境均未开放", absentOk);
+            Check("关卡表：天降种子已开放（InputPlantCoin 的前提）", coinModeOk);
             Check("关卡表：生存四族各 5 场景共 20 项齐备", survivalOk);
 
             // 排序：页签 → GameMode 数值。曾经按游戏的行/列排，结果大泳池那几条
@@ -538,7 +545,7 @@ namespace PGvZOnlineVerify
             int got = 0;
             bool sunProd = false, skySun = false, pause = false, rake = false, cutscene = false,
                 accel = false, allReady = false, cursorAt = false, chatAt = false, roomReady = false,
-                kick = false, seed = false;
+                kick = false, seed = false, rain = false, plantCoin = false;
 
             client.OnConnected += (c, r) => connected.Set();
             client.OnData += im =>
@@ -590,8 +597,16 @@ namespace PGvZOnlineVerify
                     case PacketType.SeedState:
                         seed = Packets.ReadSeedState(im) == 3;
                         break;
+                    case PacketType.RainSeedPacket:
+                        Packets.ReadRainSeedPacket(im, out float rx2, out int rseed, out int rnext);
+                        rain = rx2 > 313.2f && rx2 < 313.3f && rseed == 53 && rnext == 4444;
+                        break;
+                    case PacketType.InputPlantCoin:
+                        Packets.ReadInputPlantCoin(im, out int poslot, out int pseed, out int pimit, out int pgx, out int pgy);
+                        plantCoin = poslot == 2 && pseed == 12 && pimit == 53 && pgx == 3 && pgy == 4;
+                        break;
                 }
-                if (++got >= 12)
+                if (++got >= 14)
                 {
                     arrived.Set();
                 }
@@ -632,6 +647,8 @@ namespace PGvZOnlineVerify
                 Send(m => Packets.WriteRoomReadyRequest(m, true));
                 Send(m => Packets.WriteKick(m, "你被主机踢出了房间"));
                 Send(m => Packets.WriteSeedState(m, 3));
+                Send(m => Packets.WriteRainSeedPacket(m, 313.25f, 53, 4444));
+                Send(m => Packets.WriteInputPlantCoin(m, 2, 12, 53, 3, 4));
                 while (!arrived.IsSet && sw.Elapsed.TotalSeconds < 5)
                 {
                     host.Poll();
@@ -646,6 +663,8 @@ namespace PGvZOnlineVerify
                 "cut=" + cutscene + " accel=" + accel + " allReady=" + allReady + " cursor=" + cursorAt);
             Check("扩展：聊天中继(中文)/房间准备/踢人/选卡位图 往返", chatAt && roomReady && kick && seed,
                 "chat=" + chatAt + " ready=" + roomReady + " kick=" + kick + " seed=" + seed);
+            Check("扩展：天降种子包 / 种子包种植请求 往返", rain && plantCoin,
+                "rain=" + rain + " plantCoin=" + plantCoin);
             host.Shutdown();
             client.Shutdown();
         }
