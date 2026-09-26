@@ -168,6 +168,60 @@ namespace PGvZOnlineMod.Sync
             }
         }
 
+        /// <summary>
+        /// 远端玩家放下手套里的植物：主机按 netId 找到自己那株、合成一次真实的"手套已抓起"光标，
+        /// 再把同一笔手势（棋盘像素 + clickCount）交给原生 MouseUpWithPlant 重放——
+        /// 放得下就 MovePlant，放不下就回原位或当场枯死，结论与真人操作一致。
+        /// 手套冷却是自己的账：先存后还，不能打在主机身上。
+        /// </summary>
+        public static void ExecuteMovePlant(Board board, uint plantNetId, int x, int y, int clickCount)
+        {
+            try
+            {
+                if (board == null || board.mPaused || plantNetId == 0)
+                {
+                    return;
+                }
+                if (!Session.Registry.TryGetObject(plantNetId, out var obj)
+                    || obj is not Plant plant || plant.mDead)
+                {
+                    return; // 对方指的那株已经没了
+                }
+                var cursor = board.mCursorObject;
+                var challenge = board.mChallenge;
+                if (cursor == null || challenge == null)
+                {
+                    return;
+                }
+                int savedGloveCounter = challenge.mGloveCounter;
+                Session.ExecutingRemoteInput = true;
+                try
+                {
+                    cursor.mCursorType = CursorType.PlantFromGlove;
+                    cursor.mType = plant.mSeedType;
+                    cursor.mImitaterType = plant.mImitaterType;
+                    cursor.mGlovePlantID = plant;
+                    plant.mGloveGrabbed = true;
+                    board.MouseUpWithPlant(x, y, clickCount);
+                }
+                finally
+                {
+                    // 手势结束一定要松手：原生只在"放得下/枯死"两条分支里清 mGloveGrabbed，
+                    // 中途 return（判定不通过）时留着标记会让这株植物一直跟着光标画
+                    plant.mGloveGrabbed = false;
+                    cursor.mGlovePlantID = null;
+                    cursor.mCursorType = CursorType.Normal;
+                    cursor.mType = SeedType.None;
+                    challenge.mGloveCounter = savedGloveCounter;
+                    Session.ExecutingRemoteInput = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEnv.Log("执行远端挪植物异常: " + ex);
+            }
+        }
+
         public static void ExecuteShovel(Board board, int gridX, int gridY)
         {
             try

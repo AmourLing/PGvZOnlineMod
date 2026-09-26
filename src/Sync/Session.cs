@@ -163,8 +163,8 @@ namespace PGvZOnlineMod.Sync
         /// ① 出怪可控：通用波次 SpawnZombieWave、模式专用 Challenge.UpdateZombieSpawning、
         ///    墓碑/屋顶空降/泳池出水 Board.SpawnZombiesFromGraves——三条造僵尸的入口客户端都已钩住，
         ///    僵尸只能由主机的 SpawnBatch 创建。
-        /// ② 输入只有三种：卡槽种植、捡来的种子包种植、铲除。锤子/开罐/拖拽换牌没有转发；
-        ///    手套（挪植物）联机中全体禁用——植物的格坐标没有同步通道，主机挪了别人看不见。
+        /// ② 输入只有：卡槽种植、捡来的种子包 / 传送带卡种植、铲除、手套挪植物（转发手势 +
+        ///    PlantMoved 广播）。锤子/开罐/拖拽换牌没有转发。
         /// ③ 过关判定必须是共享状态：阳光与卡组各人独立，所以"本地阳光攒够就通关"的不能开。
         /// 还有一类是"逐帧改世界状态、而那个状态本身不在同步字段里"（冰面按行融化、传送门随机搬位、
         /// 速度关重入整局更新），得先补批量同步才救得回来，同样先排除。
@@ -189,12 +189,9 @@ namespace PGvZOnlineMod.Sync
             case GameMode.ChallengeBeghouledTwist:
             // ③ 18 老虎机的通关判定是"本地阳光攒满 2000"，阳光各人独立 → 每人各自时刻通关。
             case GameMode.ChallengeSlotMachine:
-            // ② 的延伸：手套被整体禁用，而这些关把手套当主要操作手，禁了等于缺一根手指。
-            case GameMode.ImitaterRandom:
-            case GameMode.ChallengeFusion:
+            // 关卡随机数按机器取种：149 随机挑战两端可能落在完全不同的场地上（背景/行配置都不一样），
+            // 场地不同就已经不是同一关了。
             case GameMode.ChallengeStageRandom:
-            case GameMode.RogueConveyorbelt:
-            case GameMode.RogueConveyorbeltHard:
             // 逐帧改世界状态、而该状态不同步：41 冰面按行融化（mIceTimer[]）、
             // 25 传送门位置本地随机搬、28 速度关在 Challenge.Update 里重入 Board.UpdateGame、
             // 30 最后一战有自己的阶段状态机 + 中途重选卡。
@@ -1246,6 +1243,65 @@ namespace PGvZOnlineMod.Sync
             }
         }
 
+        // ============================================================ 植物挪格同步（手套）
+
+        /// <summary>
+        /// 植物换了格子——快照只认"多出来"和"消失"，位置变了看不出来，所以必须单独广播。
+        /// 走原生 `Challenge.MovePlant`，顺手把莲叶/花盆这些挂在旧格的网格物一起带过去。
+        /// </summary>
+        public static void OnHostPlantMoved(Plant plant, int gridX, int gridY)
+        {
+            if (!IsHost || !SyncActive || plant == null)
+            {
+                return;
+            }
+            try
+            {
+                if (!Registry.TryGetId(plant, out uint id))
+                {
+                    return; // 这株植物还没进过同步（开局前的预览植物之类），不用广播
+                }
+                var m = Net.CreateMessage();
+                if (m == null)
+                {
+                    return;
+                }
+                Packets.WritePlantMoved(m, id, gridX, gridY);
+                Net.SendReliableToClients(m);
+                ModEnv.Log("[挪植物] 主机广播 netId=" + id + " → " + gridX + "," + gridY);
+            }
+            catch (Exception ex)
+            {
+                ModEnv.Log("挪植物广播异常: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Client：让本地那株同 netId 的植物走原生 MovePlant 落到新格（莲叶/花盆一起带过去）。
+        /// 不会再弹回主机——`OnHostPlantMoved` 只对主机发言，所以这里不需要额外标志。
+        /// </summary>
+        public static void OnRemotePlantMoved(uint plantNetId, int gridX, int gridY)
+        {
+            var board = CurrentBoard;
+            if (board?.mChallenge == null || !SyncActive || IsHost || plantNetId == 0)
+            {
+                return;
+            }
+            try
+            {
+                if (!Registry.TryGetObject(plantNetId, out var obj) || obj is not Plant plant
+                    || plant.mDead || gridX < 0 || gridY < 0 || gridY >= Constants.MAX_GRIDSIZEY)
+                {
+                    return;
+                }
+                board.mChallenge.MovePlant(plant, gridX, gridY);
+            }
+            catch (Exception ex)
+            {
+                ModEnv.Log("同步挪植物异常: " + ex.Message);
+            }
+        }
+
         // ============================================================ 开场预览僵尸同步
 
         /// <summary>Host：开场预览僵尸生成 → 广播（类型/格坐标，客户端镜像，随开场清理）。</summary>
@@ -2137,6 +2193,27 @@ namespace PGvZOnlineMod.Sync
                     break;
                 }
 
+                case PacketType.InputMovePlant:
+                {
+                    Packets.ReadInputMovePlant(im, out _, out uint plantId, out int mx, out int my, out int click);
+                    var board = CurrentBoard;
+                    if (IsHost && board != null)
+                    {
+                        MainThreadQueue.Post(() => InputExecutor.ExecuteMovePlant(board, plantId, mx, my, click));
+                    }
+                    break;
+                }
+
+                case PacketType.PlantMoved:
+                {
+                    Packets.ReadPlantMoved(im, out uint plantId, out int gx, out int gy);
+                    if (!IsHost)
+                    {
+                        OnRemotePlantMoved(plantId, gx, gy);
+                    }
+                    break;
+                }
+
                 case PacketType.InputShovel:
                 {
                     Packets.ReadInputShovel(im, out _, out int gx, out int gy);
@@ -2448,6 +2525,18 @@ namespace PGvZOnlineMod.Sync
                 return;
             }
             Packets.WriteInputPlantCoin(m, playerSlot, seedType, imitaterType, gridX, gridY);
+            Net.SendReliableToHost(m);
+        }
+
+        /// <summary>客户端把手套里的植物放下：手势原样交主机重放，落点结论由主机给。</summary>
+        public static void SendMovePlantRequest(int playerSlot, uint plantNetId, int x, int y, int clickCount)
+        {
+            var m = Net.CreateMessage();
+            if (m == null)
+            {
+                return;
+            }
+            Packets.WriteInputMovePlant(m, playerSlot, plantNetId, x, y, clickCount);
             Net.SendReliableToHost(m);
         }
 

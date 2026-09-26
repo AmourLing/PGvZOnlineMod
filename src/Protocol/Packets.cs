@@ -12,10 +12,11 @@ namespace PGvZOnlineMod.Protocol
     /// v17 = 没加消息，但"谁在造僵尸"变了：客户端把墓碑起僵尸/屋顶空降/泳池出水一并锁进总闸，
     ///       传送带关卡的卡改按种子类型转发。老 v16 客户端仍会在本地凭空造僵尸，
     ///       与新端配对必不同步——语义不兼容就得升号。
+    /// v18 = 手套（挪植物）转发 + PlantMoved 广播：植物格坐标从此是同步字段。
     /// </summary>
     public static class ProtocolVersion
     {
-        public const int Current = 17;
+        public const int Current = 18;
     }
 
     /// <summary>模组标识哈希：进握手包，两端必须一致（防不同版本逻辑不同步）。</summary>
@@ -72,8 +73,12 @@ namespace PGvZOnlineMod.Protocol
         SeedState = 27,
         /// <summary>Host 天降了一枚可用种子包（载荷=落点x/种子类型/新模式倒计时），客户端同位置掉自己的一份</summary>
         RainSeedPacket = 28,
-        /// <summary>客户端把手里捡的种子包 / 传送带上的卡种下去（载荷=槽位/种子类型/变异类型/格坐标）</summary>
+        /// <summary>客户端把手里捡到的种子包 / 传送带上的卡种下去（载荷=槽位/种子类型/变异类型/格坐标）</summary>
         InputPlantCoin = 29,
+        /// <summary>客户端用把手套里的植物放下（载荷=槽位/植物netId/x/y/clickCount）——原手势整个交给主机重放</summary>
+        InputMovePlant = 30,
+        /// <summary>植物挪到新格（载荷=netId/格x/格y），主机 → 全员（含发起者），本地重放原生 MovePlant</summary>
+        PlantMoved = 31,
     }
 
     // ------------------------------------------------------------ 数据结构（Lawn 无关，离线可测）
@@ -479,6 +484,45 @@ namespace PGvZOnlineMod.Protocol
             playerSlot = m.ReadInt32();
             seedType = m.ReadInt32();
             imitaterType = m.ReadInt32();
+            gridX = m.ReadInt32();
+            gridY = m.ReadInt32();
+        }
+
+        /// <summary>
+        /// 手套放下植物。传的是**棋盘像素 + clickCount**，不是格坐标：
+        /// 放哪算合法、放不进是回原位还是当场枯死，全由原生那套判定给结论，
+        /// 主机原样重放一遍就等于大家都看过同一次操作。
+        /// </summary>
+        public static void WriteInputMovePlant(NetOutgoingMessage m, int playerSlot, uint plantNetId, int x, int y, int clickCount)
+        {
+            m.Write((byte)PacketType.InputMovePlant);
+            m.Write(playerSlot);
+            m.Write(plantNetId);
+            m.Write(x);
+            m.Write(y);
+            m.Write(clickCount);
+        }
+
+        public static void ReadInputMovePlant(NetIncomingMessage m, out int playerSlot, out uint plantNetId, out int x, out int y, out int clickCount)
+        {
+            playerSlot = m.ReadInt32();
+            plantNetId = m.ReadUInt32();
+            x = m.ReadInt32();
+            y = m.ReadInt32();
+            clickCount = m.ReadInt32();
+        }
+
+        public static void WritePlantMoved(NetOutgoingMessage m, uint plantNetId, int gridX, int gridY)
+        {
+            m.Write((byte)PacketType.PlantMoved);
+            m.Write(plantNetId);
+            m.Write(gridX);
+            m.Write(gridY);
+        }
+
+        public static void ReadPlantMoved(NetIncomingMessage m, out uint plantNetId, out int gridX, out int gridY)
+        {
+            plantNetId = m.ReadUInt32();
             gridX = m.ReadInt32();
             gridY = m.ReadInt32();
         }

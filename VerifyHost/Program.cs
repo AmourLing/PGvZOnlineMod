@@ -180,6 +180,7 @@ namespace PGvZOnlineVerify
                 GameMode.ChallengeWhackAZombie, GameMode.ScaryPotter1,
                 GameMode.PuzzleIZombie1, GameMode.ChallengeZenGarden,
                 GameMode.ChallengeIce, GameMode.ChallengePortalCombat,
+                GameMode.ChallengeStageRandom, // 149 关卡随机数按机器取种，两端可能不在同一张场地上
             };
             bool absentOk = true;
             foreach (var bad in mustBeAbsent)
@@ -200,6 +201,9 @@ namespace PGvZOnlineVerify
                 GameMode.ChallengeWallnutBowling2, // 32
                 GameMode.ChallengeGraveDanger,    // 44 靠墓碑出怪闸
                 GameMode.ExtraChallengeStart,     // 123 额外页第一关
+                GameMode.ImitaterRandom,          // 132 手套转发通了才敢放
+                GameMode.ChallengeFusion,         // 148 同上
+                GameMode.RogueConveyorbelt,       // 129 同上（带子卡另走 InputPlantCoin）
             };
             bool presentOk = true;
             foreach (var want in mustBePresent)
@@ -215,7 +219,7 @@ namespace PGvZOnlineVerify
             Check("关卡表：开放集合与排除名单互斥", onlyUnblocked);
             Check("关卡表：全表每条要么开放、要么被点名排除（无判据盲区）", covered);
             Check("关卡表：老虎机/宝石迷阵/砸罐子/我是僵尸/敲僵尸/禅境/冰面/传送门均未开放", absentOk);
-            Check("关卡表：天降种子与四类已验证的挑战关确实在表里", presentOk);
+            Check("关卡表：九条正面钉法都在表里（种子包闸 / 墓碑闸 / 手套转发的前提）", presentOk);
             Check("关卡表：生存四族各 5 场景共 20 项齐备", survivalOk);
 
             // 排序：页签 → GameMode 数值。曾经按游戏的行/列排，结果大泳池那几条
@@ -579,7 +583,8 @@ namespace PGvZOnlineVerify
             int got = 0;
             bool sunProd = false, skySun = false, pause = false, rake = false, cutscene = false,
                 accel = false, allReady = false, cursorAt = false, chatAt = false, roomReady = false,
-                kick = false, seed = false, rain = false, plantCoin = false;
+                kick = false, seed = false, rain = false, plantCoin = false,
+                movePlant = false, plantMoved = false;
 
             client.OnConnected += (c, r) => connected.Set();
             client.OnData += im =>
@@ -635,12 +640,20 @@ namespace PGvZOnlineVerify
                         Packets.ReadRainSeedPacket(im, out float rx2, out int rseed, out int rnext);
                         rain = rx2 > 313.2f && rx2 < 313.3f && rseed == 53 && rnext == 4444;
                         break;
+                    case PacketType.InputMovePlant:
+                        Packets.ReadInputMovePlant(im, out int mslot, out uint mnid, out int mx, out int my, out int mclick);
+                        movePlant = mslot == 2 && mnid == 90210u && mx == -30 && my == 512 && mclick == -1;
+                        break;
+                    case PacketType.PlantMoved:
+                        Packets.ReadPlantMoved(im, out uint pmid, out int mvx, out int mvy);
+                        plantMoved = pmid == 90210u && mvx == 7 && mvy == 4;
+                        break;
                     case PacketType.InputPlantCoin:
                         Packets.ReadInputPlantCoin(im, out int poslot, out int pseed, out int pimit, out int pgx, out int pgy);
                         plantCoin = poslot == 2 && pseed == 12 && pimit == 53 && pgx == 3 && pgy == 4;
                         break;
                 }
-                if (++got >= 14)
+                if (++got >= 16)
                 {
                     arrived.Set();
                 }
@@ -683,6 +696,8 @@ namespace PGvZOnlineVerify
                 Send(m => Packets.WriteSeedState(m, 3));
                 Send(m => Packets.WriteRainSeedPacket(m, 313.25f, 53, 4444));
                 Send(m => Packets.WriteInputPlantCoin(m, 2, 12, 53, 3, 4));
+                Send(m => Packets.WriteInputMovePlant(m, 2, 90210u, -30, 512, -1));
+                Send(m => Packets.WritePlantMoved(m, 90210u, 7, 4));
                 while (!arrived.IsSet && sw.Elapsed.TotalSeconds < 5)
                 {
                     host.Poll();
@@ -699,6 +714,10 @@ namespace PGvZOnlineVerify
                 "chat=" + chatAt + " ready=" + roomReady + " kick=" + kick + " seed=" + seed);
             Check("扩展：天降种子包 / 种子包种植请求 往返", rain && plantCoin,
                 "rain=" + rain + " plantCoin=" + plantCoin);
+            // 挪植物的请求带棋盘像素与 clickCount（放不进/丢垃圾桶靠它区分），netId 走无符号：
+            // 写成有符号或写窄，这条会直接红。
+            Check("扩展：手套挪植请求 / PlantMoved 广播 往返", movePlant && plantMoved,
+                "move=" + movePlant + " moved=" + plantMoved);
             host.Shutdown();
             client.Shutdown();
         }

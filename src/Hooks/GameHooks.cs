@@ -68,10 +68,11 @@ namespace PGvZOnlineMod.Hooks
             HookEndpointManager.Add(HookInstaller.M(typeof(Board), "SpawnZombiesFromGraves", Type.EmptyTypes),
                 (Action<Action<Board>, Board>)BoardSpawnZombiesFromGravesHook);
 
-            // 手套（把植物拔起来挪个格子）：植物的格坐标没有同步通道，主机挪了别人看不见，
-            // 所以联机中两端一律不给拿起来——要换位只能用铲子重新种。
-            HookEndpointManager.Add(HookInstaller.M(typeof(Board), "PickUpTool", new[] { typeof(GameObjectType) }),
-                (Action<Action<Board, GameObjectType>, Board, GameObjectType>)BoardPickUpToolHook);
+            // 植物换格：快照只认"多出来/消失"，位置变了看不出来，所以 MovePlant 是唯一的补发点
+            // （主机自己挪的、以及主机替客人重放的，都从这里广播出去）。
+            HookEndpointManager.Add(HookInstaller.M(typeof(Challenge), "MovePlant",
+                    new[] { typeof(Plant), typeof(int), typeof(int) }),
+                (Action<Action<Challenge, Plant, int, int>, Challenge, Plant, int, int>)ChallengeMovePlantHook);
 
             // 天降种子雨：Client 抑制本地随机掉落，Host 掉出种子包后广播（落点/卡种/下轮排期）。
             // 19 天降种子的主循环，也是 131 僵尸博士2 的种子雨来源。
@@ -345,20 +346,16 @@ namespace PGvZOnlineMod.Hooks
         }
 
         /// <summary>
-        /// 联机中谁都不许拿起手套：植物被挪到新格子这件事没有同步通道（快照只补"多出来"和"消失"
-        /// 的植物，位置变了看不出来），任一方挪一次就让两块草坪对不上。要换位请用铲子。
-        /// 只在联机同步中拦，断线回退单机后手套照旧。
+        /// 植物换格既不是新增也不是消失，快照比对看不出来，所以要在这里补发一条事件。
+        /// 全游戏改 mPlantCol 的只有创建（走 SpawnBatch）、存档回灌、宝石迷阵换牌（未开放），
+        /// 以及 Challenge.MovePlant——它就是手套挪格的唯一出口。
+        /// 客户端应用主机事件时本来就不是主机，OnHostPlantMoved 自己就不发了，不必额外判标志。
         /// </summary>
-        private static void BoardPickUpToolHook(Action<Board, GameObjectType> orig, Board self, GameObjectType theObjectType)
+        private static void ChallengeMovePlantHook(Action<Challenge, Plant, int, int> orig,
+            Challenge self, Plant thePlant, int theGridX, int theGridY)
         {
-            if (theObjectType == GameObjectType.Glove && Session.SyncActive)
-            {
-                Session.LastChat = "联机中不能挪植物：要换位请用铲子铲掉再种";
-                Session.LastChatAge = 0;
-                ModEnv.LogOnce("[手套] 联机中已禁用（重复点击不再记）");
-                return;
-            }
-            orig(self, theObjectType);
+            orig(self, thePlant, theGridX, theGridY);
+            Session.OnHostPlantMoved(thePlant, theGridX, theGridY);
         }
 
         /// <summary>
@@ -412,6 +409,36 @@ namespace PGvZOnlineMod.Hooks
             if (Session.ExecutingRemoteInput)
             {
                 orig(self, x, y, theClickCount);
+                return;
+            }
+            // 手套放下植物：本地一律不挪（挪格结论等主机的 PlantMoved），把手势原样转给主机重放。
+            // 松手要立刻做——不松的话这株植物会一直跟着光标画在指针上。
+            if (Session.ClientSuppressionActive
+                && self.mCursorObject != null
+                && self.mCursorObject.mCursorType == CursorType.PlantFromGlove)
+            {
+                var held = self.mCursorObject.mGlovePlantID;
+                uint netId = 0;
+                if (held != null)
+                {
+                    Session.Registry.TryGetId(held, out netId);
+                }
+                self.mCursorObject.mGlovePlantID = null;
+                self.mCursorObject.mCursorType = CursorType.Normal;
+                self.mCursorObject.mType = SeedType.None;
+                if (held != null)
+                {
+                    held.mGloveGrabbed = false;
+                }
+                if (netId != 0)
+                {
+                    Session.SendMovePlantRequest(Session.MySlot, netId, x, y, theClickCount);
+                    Core.ModEnv.Log("[挪植物] 客户端请求 netId=" + netId + " 落点=" + x + "," + y);
+                }
+                else
+                {
+                    Core.ModEnv.LogOnce("[挪植物] 这株植物还没有网络编号，请求发不出去（重复不再记）");
+                }
                 return;
             }
             // 手里拿着"捡来的种子包"（19 天上掉的，以及其他关里掉地的可用种子包）：
