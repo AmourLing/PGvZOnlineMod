@@ -331,8 +331,17 @@ namespace PGvZOnlineMod.Hooks
             {
                 return;
             }
+            // 这钩子每帧都进（19/131 全程），前后两段各自兜住，orig 无论如何要执行——
+            // 否则一次异常就会把整局钉死在坏帧上
             var board = self?.mBoard;
-            int coinsBefore = board?.mCoins == null ? 0 : board.mCoins.Count;
+            int coinsBefore = 0;
+            try
+            {
+                coinsBefore = board?.mCoins == null ? 0 : board.mCoins.Count;
+            }
+            catch
+            {
+            }
             orig(self);
             if (board == null || !Session.IsHost || !Session.SyncActive)
             {
