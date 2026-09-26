@@ -37,9 +37,11 @@ python 打包.py                                   :: 编译 + 回归 + 打 zip 
 
 把 zip 内全部内容复制进游戏的 `mods\`（`PGvZOnlineMod.dll` 必须直接位于顶层）即完成安装；
 主菜单"在线关卡"下方出现 **[联机]** 按钮即加载成功。
-csproj 引用 `..\..\PlantGirlsVsZombies\LawnDLL\` 下的 Lawn / Lidgren / MonoGame /
+csproj 引用游戏目录 `..\..\PlantGirlsVsZombies\LawnDLL\` 下的 Lawn / Lidgren / MonoGame /
 MonoMod.RuntimeDetour / IronPython / Newtonsoft（全部 `Private=false`，运行时由游戏加载）；
-本机 NuGet 组件损坏时 `打包.py` 自带降级链。
+**游戏不在默认位置时不用改工程文件**，指一次即可（两个工程共用，结尾有无 `\` 都行）：
+`dotnet build PGvZOnlineMod.sln -c Release -p:PgvzRefDir="D:\games\PlantGirlsVsZombies\LawnDLL"`，
+指错会直接告诉你缺的是哪个文件。本机 NuGet 组件损坏时 `打包.py` 自带降级链。
 
 - Windows mods 目录：`%AppData%\ZBC\PlantGirlsVsZombies\mods\`
 - Android mods 目录：`/storage/emulated/0/Android/data/net.pvz.pgvz.zbcteam/files/mods`

@@ -22,32 +22,32 @@
   <ItemGroup>
     <!-- 引用游戏自带程序集（Private=false：不复制到输出目录，运行时游戏已加载同名程序集） -->
     <Reference Include="Lawn">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Lawn.dll</HintPath>
+      <HintPath>$(PgvzRef)Lawn.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="IronPython">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\IronPython.dll</HintPath>
+      <HintPath>$(PgvzRef)IronPython.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Microsoft.Scripting">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Microsoft.Scripting.dll</HintPath>
+      <HintPath>$(PgvzRef)Microsoft.Scripting.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="MonoGame.Framework">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\MonoGame.Framework.dll</HintPath>
+      <HintPath>$(PgvzRef)MonoGame.Framework.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="MonoMod.RuntimeDetour">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.RuntimeDetour.dll</HintPath>
+      <HintPath>$(PgvzRef)MonoMod.RuntimeDetour.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Newtonsoft.Json">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Newtonsoft.Json.dll</HintPath>
+      <HintPath>$(PgvzRef)Newtonsoft.Json.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- 传输层：Lawn.dll 本体的依赖（Lawn.deps.json: Lidgren.Network.Core2 1.0.0），随游戏进程已加载 -->
     <Reference Include="Lidgren.Network">
-      <HintPath>..\..\PlantGirlsVsZombies\LawnDLL\Lidgren.Network.Core.dll</HintPath>
+      <HintPath>$(PgvzRef)Lidgren.Network.Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

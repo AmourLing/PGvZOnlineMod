@@ -1,0 +1,19 @@
+<Project>
+
+  <!-- 游戏程序集所在目录。它在仓库之外（公开仓库里不带这些 DLL），所以留一个可覆盖的开关：
+         dotnet build PGvZOnlineMod.sln -c Release -p:PgvzRefDir="D:\games\PlantGirlsVsZombies\LawnDLL"
+       默认值按本文件所在仓库根的上两级找；结尾有没有 \ 都行；
+       两个工程（mod 与 VerifyHost）都自动 import 本文件，所以只需指一次。
+       注意：命令行 -p: 传进来的是 MSBuild 全局属性，工程内再赋值会被忽略，
+       所以规整结果放到派生属性 PgvzRef 里，引用一律写 $(PgvzRef)。 -->
+  <PropertyGroup>
+    <PgvzRefDir Condition="'$(PgvzRefDir)' == ''">$(MSBuildThisFileDirectory)..\..\PlantGirlsVsZombies\LawnDLL</PgvzRefDir>
+    <PgvzRef>$([MSBuild]::EnsureTrailingSlash('$(PgvzRefDir)'))</PgvzRef>
+  </PropertyGroup>
+
+  <!-- 目录指错时先说人话，别抛一屏 CS0246「找不到类型或命名空间」 -->
+  <Target Name="PgvzRefGuard" BeforeTargets="ResolveReferences" Condition="!Exists('$(PgvzRef)Lawn.dll')">
+    <Error Text="找不到游戏程序集 $(PgvzRef)Lawn.dll —— 用 -p:PgvzRefDir=&quot;游戏目录\LawnDLL&quot; 指向放着 Lawn.dll 的目录" />
+  </Target>
+
+</Project>

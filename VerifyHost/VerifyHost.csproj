@@ -30,37 +30,37 @@
 
   <ItemGroup>
     <Reference Include="Lawn">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Lawn.dll</HintPath>
+      <HintPath>$(PgvzRef)Lawn.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="MonoGame.Framework">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\MonoGame.Framework.dll</HintPath>
+      <HintPath>$(PgvzRef)MonoGame.Framework.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="Newtonsoft.Json">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Newtonsoft.Json.dll</HintPath>
+      <HintPath>$(PgvzRef)Newtonsoft.Json.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="Lidgren.Network">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Lidgren.Network.Core.dll</HintPath>
+      <HintPath>$(PgvzRef)Lidgren.Network.Core.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <!-- 离线 detour 验证：与游戏同源的 MonoMod 栈（detour 必须跑在 net6.0 宿主） -->
     <Reference Include="MonoMod.RuntimeDetour">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.RuntimeDetour.dll</HintPath>
+      <HintPath>$(PgvzRef)MonoMod.RuntimeDetour.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="MonoMod.Utils">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.Utils.dll</HintPath>
+      <HintPath>$(PgvzRef)MonoMod.Utils.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="Mono.Cecil">
-      <HintPath>..\..\..\PlantGirlsVsZombies\LawnDLL\Mono.Cecil.dll</HintPath>
+      <HintPath>$(PgvzRef)Mono.Cecil.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <!-- MonoMod/Cecil 运行时依赖链全量复制（同 植物娘AI对话 VerifyHost 实测配置） -->
-    <None Include="..\..\..\PlantGirlsVsZombies\LawnDLL\MonoMod.*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
-    <None Include="..\..\..\PlantGirlsVsZombies\LawnDLL\Mono.Cecil*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
+    <None Include="$(PgvzRef)MonoMod.*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
+    <None Include="$(PgvzRef)Mono.Cecil*.dll" CopyToOutputDirectory="PreserveNewest" Link="%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>
