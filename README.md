@@ -29,6 +29,7 @@
 
 ```bat
 cd /d D:\植物大战僵尸\WP_PGVZ\my_mods\PGvZOnlineMod
+dotnet build PGvZOnlineMod.sln -c Release           :: 一条命令编两个项目（mod + 回归台）
 dotnet build -c Release                          :: mod → bin\Release\net6.0\PGvZOnlineMod.dll
 dotnet run --project VerifyHost -c Release --no-build :: 离线回归门（43 项，exit 0 = 全过）
 python 打包.py                                   :: 编译 + 回归 + 打 zip 到 publish\
@@ -58,6 +59,9 @@ MonoMod.RuntimeDetour / IronPython / Newtonsoft（全部 `Private=false`，运�
 - 完整的已知边界与风险清单见 `项目文档.md` 第 16 节。
 
 ## 代码结构
+
+用 `PGvZOnlineMod.sln` 在 VS / Rider 里打开就是两个项目：`PGvZOnlineMod`（模组本体）
+与 `VerifyHost`（离线回归台）。
 
 `src/{Core,Protocol,Net,Sync,Hooks,Ui}` + `VerifyHost/`（离线回归台），
 逐文件职责与行数见 `项目文档.md` 第 3 节。
