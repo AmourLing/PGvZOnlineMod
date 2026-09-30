@@ -17,6 +17,7 @@
     <Compile Include="..\src\Core\MainThreadQueue.cs" Link="linked\MainThreadQueue.cs" />
     <Compile Include="..\src\Core\NetIdRegistry.cs" Link="linked\NetIdRegistry.cs" />
     <Compile Include="..\src\Protocol\Packets.cs" Link="linked\Packets.cs" />
+    <Compile Include="..\src\Protocol\RelayProtocol.cs" Link="linked\RelayProtocol.cs" />
     <Compile Include="..\src\Net\NetMgr.cs" Link="linked\NetMgr.cs" />
     <Compile Include="..\src\Hooks\HookInstaller.cs" Link="linked\HookInstaller.cs" />
     <Compile Include="..\src\Hooks\GameHooks.cs" Link="linked\GameHooks.cs" />

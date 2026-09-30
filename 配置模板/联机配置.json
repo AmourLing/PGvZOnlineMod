@@ -1,9 +1,9 @@
 {
-  "Nickname": "玩家",
   "HostPort": 27150,
   "LastIp": "127.0.0.1",
   "LastPort": 27150,
   "SnapshotHz": 20,
   "CursorHz": 10,
-  "ZombieHpPerExtraPlayer": 0.35
+  "ZombieHpPerExtraPlayer": 0.35,
+  "Servers": []
 }

@@ -11,8 +11,10 @@
     <PgvzRef>$([MSBuild]::EnsureTrailingSlash('$(PgvzRefDir)'))</PgvzRef>
   </PropertyGroup>
 
-  <!-- 目录指错时先说人话，别抛一屏 CS0246「找不到类型或命名空间」 -->
-  <Target Name="PgvzRefGuard" BeforeTargets="ResolveReferences" Condition="!Exists('$(PgvzRef)Lawn.dll')">
+  <!-- 目录指错时先说人话，别抛一屏 CS0246「找不到类型或命名空间」。
+       不引用游戏程序集的工程（如中继服务端）在属性里置 PgvzRefGuard=false 跳过。 -->
+  <Target Name="PgvzRefGuard" BeforeTargets="ResolveReferences"
+          Condition="'$(PgvzRefGuard)' != 'false' and !Exists('$(PgvzRef)Lawn.dll')">
     <Error Text="找不到游戏程序集 $(PgvzRef)Lawn.dll —— 用 -p:PgvzRefDir=&quot;游戏目录\LawnDLL&quot; 指向放着 Lawn.dll 的目录" />
   </Target>
 

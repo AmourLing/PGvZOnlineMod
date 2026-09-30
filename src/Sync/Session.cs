@@ -547,7 +547,7 @@ namespace PGvZOnlineMod.Sync
                 SetStatus("开房失败: " + Net.Error, true);
                 return;
             }
-            Nicks[0] = cfg.Nickname;
+            Nicks[0] = LocalNick();
             // 主机自己的座位必须算占用：漏了它会导致
             // ① 主机点完选卡就以为"全员就绪"（AllPlayersReady 看不见主机自己），
             //    客人被 AllReady 放进战场而主机还停在选卡界面；
@@ -587,7 +587,7 @@ namespace PGvZOnlineMod.Sync
             }
             Nicks[0] = "";
             SlotOccupied[0] = false; // 主机位由 RoomState 置回；避免"先建房后加入"时残留
-            Nicks[MySlot] = cfg.Nickname;
+            Nicks[MySlot] = LocalNick();
             for (int i = 1; i < MaxPlayers; i++)
             {
                 if (i != MySlot)
@@ -884,8 +884,31 @@ namespace PGvZOnlineMod.Sync
 
         // ============================================================ 主线程泵（LawnApp.UpdateFrames 钩子）
 
+        private static LawnApp _app;
+
+        /// <summary>
+        /// 本端显示名：直接用游戏自己的玩家名（存档里那个，主菜单"欢迎 XXX"同一来源），
+        /// 联机页不再单独设一份昵称——两处各存一份迟早对不上。名字为空时回落到"玩家"。
+        /// </summary>
+        public static string LocalNick()
+        {
+            try
+            {
+                string name = _app?.mPlayerInfo?.mName;
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    return name.Trim();
+                }
+            }
+            catch
+            {
+            }
+            return "玩家";
+        }
+
         public static void Pump(LawnApp app)
         {
+            _app = app;
             _now = _clock.Elapsed.TotalSeconds;
             MainThreadQueue.Pump();
             Net.Poll();
@@ -1974,12 +1997,11 @@ namespace PGvZOnlineMod.Sync
                 }
                 else
                 {
-                    var cfg = ModEnv.GetConfig();
                     var m = Net.CreateMessage();
                     if (m != null)
                     {
                         Packets.WriteHandshake(m, PacketType.HandshakeC2H, ProtocolVersion.Current,
-                            LawnApp.AppVersionNumber, ModFingerprint.Fingerprint, cfg.Nickname);
+                            LawnApp.AppVersionNumber, ModFingerprint.Fingerprint, LocalNick());
                         Net.SendReliableToHost(m);
                     }
                 }

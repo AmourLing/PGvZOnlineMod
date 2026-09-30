@@ -30,8 +30,8 @@ namespace PGvZOnlineMod
                 Core.NetAsm.EnsureDependenciesLoaded();
                 // 2) 物化配置与数据目录（首次运行自动写默认 联机配置.json）
                 var config = Core.ModEnv.GetConfig();
-                Core.ModEnv.Log("配置已就绪: " + Core.ModEnv.DataDir + "，昵称=" + config.Nickname
-                    + "，端口=" + config.HostPort);
+                Core.ModEnv.Log("配置已就绪: " + Core.ModEnv.DataDir + "，端口=" + config.HostPort
+                    + "，已存服务器 " + (config.Servers?.Count ?? 0) + " 台");
                 Hooks.HookInstaller.Install();
                 Status = "installed (repeat #" + Interlocked.Increment(ref _installCount) + ")";
             }

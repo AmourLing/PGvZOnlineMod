@@ -29,7 +29,6 @@ namespace PGvZOnlineMod.Ui
         private const int LevelId = 112;
         private const int StartId = 113;
         private const int DisconnectId = 114;
-        private const int SaveNickId = 115;
         private const int ReadyBtnId = 116;
         private const int KickBtnIdBase = 125;
         private const int RoomButtonIdBase = 120;
@@ -63,11 +62,9 @@ namespace PGvZOnlineMod.Ui
         private NewLawnButton _levelBtn;
         private NewLawnButton _startBtn;
         private NewLawnButton _disconnectBtn;
-        private NewLawnButton _saveNickBtn;
         private NewLawnButton _readyBtn;
         private IpInputWidget _ipEdit;
         private IpInputWidget _portEdit;
-        private IpInputWidget _nickEdit;
 
         private bool _dropOpen;
         private int _dropPage;
@@ -229,13 +226,7 @@ namespace PGvZOnlineMod.Ui
             _backButton = MakeButton(BackId, "[BACK_TO_MENU]");
             _backButton.Resize(18, Constants.BackBufferSize.X - 40, bw, bh);
 
-            // 大厅：昵称行
-            _nickEdit = new IpInputWidget { AllowAnyChar = true, MaxLength = 12 };
-            _nickEdit.Resize(268, 50, 200, 34);
-            _nickEdit.SetText(Core.ModEnv.GetConfig().Nickname ?? "玩家");
-            AddWidget(_nickEdit);
-            _saveNickBtn = MakeButton(SaveNickId, "保存昵称");
-            _saveNickBtn.Resize(486, 46, bw, bh);
+            // 显示名不再在联机页里设：直接用游戏自己的玩家名（Session.LocalNick）
 
             // 大厅：手动加入
             _ipEdit = new IpInputWidget();
@@ -294,8 +285,6 @@ namespace PGvZOnlineMod.Ui
             _joinBtn.mVisible = !room;
             _ipEdit.mVisible = !room;
             _portEdit.mVisible = !room;
-            _nickEdit.mVisible = !room;
-            _saveNickBtn.mVisible = !room;
             _disconnectBtn.mVisible = room;
 
             bool canPick = room && host && connected;
@@ -582,7 +571,8 @@ namespace PGvZOnlineMod.Ui
 
         private void DrawLobby(Graphics g)
         {
-            Text(g, "你的昵称:", 160, 58, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
+            Text(g, "你的昵称：" + Sync.Session.LocalNick() + "（取游戏存档里的名字）",
+                160, 58, Resources.FONT_BRIANNETOD16, new SexyColor(200, 200, 200));
             Text(g, "局域网房间（点一条加入）", 160, 100, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
             if (Sync.Session.RoomList.Count == 0)
             {
@@ -730,15 +720,10 @@ namespace PGvZOnlineMod.Ui
 
         // ------------------------------------------------------------ 输入保存
 
-        /// <summary>把昵称/IP/端口写回配置（点建立/加入时落盘）。</summary>
+        /// <summary>把 IP/端口写回配置（点建立/加入时落盘）。</summary>
         private void SaveIdentity()
         {
             var cfg = Core.ModEnv.GetConfig();
-            string nick = _nickEdit.Text.Trim();
-            if (!string.IsNullOrEmpty(nick))
-            {
-                cfg.Nickname = nick;
-            }
             cfg.LastIp = _ipEdit.Text;
             if (int.TryParse(_portEdit.Text.Trim(), out int port) && port >= 1024 && port <= 65535)
             {
@@ -785,9 +770,6 @@ namespace PGvZOnlineMod.Ui
                     SaveIdentity();
                     Sync.Session.StartJoining(_app, _ipEdit.Text, ParsePort());
                     break;
-                case SaveNickId:
-                    SaveNick();
-                    break;
                 case LevelId:
                     if (!_dropOpen)
                     {
@@ -816,33 +798,6 @@ namespace PGvZOnlineMod.Ui
                     break;
             }
             RefreshUi();
-        }
-
-        private void SaveNick()
-        {
-            var cfg = Core.ModEnv.GetConfig();
-            string nick = _nickEdit.Text.Trim();
-            if (string.IsNullOrEmpty(nick))
-            {
-                Sync.Session.SetStatus("昵称不能为空", true);
-                return;
-            }
-            cfg.Nickname = nick;
-            Core.ModEnv.SaveConfig();
-            if (Sync.Session.Phase == Sync.SessionPhase.HostingLobby
-                || Sync.Session.Phase == Sync.SessionPhase.InRoom)
-            {
-                if (Sync.Session.IsHost)
-                {
-                    Sync.Session.Nicks[0] = nick;
-                    Sync.Session.BroadcastRoomState(); // 房间信息里同步新昵称
-                }
-                else
-                {
-                    Sync.Session.Nicks[Sync.Session.MySlot] = nick;
-                }
-            }
-            Sync.Session.SetStatus("昵称已保存并生效：" + nick, false);
         }
 
         private void HandleOtherButton(int theId)
@@ -929,8 +884,6 @@ namespace PGvZOnlineMod.Ui
             RemoveWidget(_disconnectBtn);
             RemoveWidget(_ipEdit);
             RemoveWidget(_portEdit);
-            RemoveWidget(_nickEdit);
-            RemoveWidget(_saveNickBtn);
             RemoveWidget(_readyBtn);
             _hits.Clear();
             base.RemovedFromManager(manager);

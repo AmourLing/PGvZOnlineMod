@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
 using System.Threading;
 using Lawn;
 using Lidgren.Network;
@@ -13,7 +15,9 @@ namespace PGvZOnlineVerify
     /// <summary>
     /// 离线验证宿主（不启动游戏）：
     ///  1. NetIdRegistry 语义；
-    ///  2. 全部消息编解码往返 —— 走真实 Lidgren 本机回环（比读内部字段更严格）。
+    ///  2. 全部消息编解码往返 —— 走真实 Lidgren 本机回环（比读内部字段更严格）；
+    ///  3. 中继控制报文的往返与畸形输入；
+    ///  4. 玩家身份与手改配置里的服务器列表。
     /// 全部通过 exit code = 0，任一失败非 0，可直接当回归门。
     /// </summary>
     internal static class Program
@@ -43,6 +47,8 @@ namespace PGvZOnlineVerify
             TestHostingSeat();
             TestLoopback();
             TestExtendedPackets();
+            TestRelayProtocol();
+            TestIdentity();
             TestDetour();
             Console.WriteLine($"== 结果：通过 {_passes} / 失败 {_failures} ==");
             return _failures == 0 ? 0 : 1;
@@ -720,6 +726,267 @@ namespace PGvZOnlineVerify
                 "move=" + movePlant + " moved=" + plantMoved);
             host.Shutdown();
             client.Shutdown();
+        }
+
+        // ------------------------------------------------------------ 4. 中继控制协议
+
+        /// <summary>
+        /// 中继那份文本控制协议。模组与 RelayServer 链入的是同一个源文件，所以这里测的不是
+        /// "我的组包和我的解包对不对得上"，而是两件真会咬人的事：
+        ///   · 玩家手输的自由文本（房间名、密码）过 Clean 后不会溢出成多余字段——否则一个
+        ///     "我的房|JOIN|123456" 就能当两条报文用；
+        ///   · 畸形报文只会得到 Unknown/回落值，不抛异常——服务端收的是公网来的任意字节。
+        /// </summary>
+        private static void TestRelayProtocol()
+        {
+            Console.WriteLine("-- 中继控制协议 --");
+
+            var host = RelayProtocol.Parse(RelayProtocol.BuildHost("测试主机☆", "p|w|d"));
+            Check("HOST 往返（房间名含中文）",
+                host.Kind == RelayKind.Host && host.Name == "测试主机☆", "kind=" + host.Kind + " name=" + host.Name);
+            Check("密码里的分隔符被 Clean 吃掉，不会多出一个字段",
+                host.Password == "pwd", "pwd=" + host.Password);
+
+            var seen = RelayProtocol.Parse(RelayProtocol.BuildSeen("123456", 7, 2, 4, "ab"));
+            Check("SEEN 往返（关卡/人数/上限/密码）",
+                seen.Kind == RelayKind.Seen && seen.Code == "123456" && seen.LevelIndex == 7
+                && seen.Players == 2 && seen.MaxPlayers == 4 && seen.Password == "ab",
+                "lvl=" + seen.LevelIndex + " p=" + seen.Players + "/" + seen.MaxPlayers);
+
+            // 主机还没选关时上报 -1；Num 的回落写成 0 就会显示成"第 0 关"
+            var seenUnknown = RelayProtocol.Parse(RelayProtocol.BuildSeen("123456", -1, 1, 4, ""));
+            Check("SEEN 的未知关卡原样保持 -1", seenUnknown.LevelIndex == -1, "lvl=" + seenUnknown.LevelIndex);
+
+            var room = RelayProtocol.Parse(RelayProtocol.BuildRoom("654905", 27201, 27200));
+            Check("ROOM 往返（客人口/主机口）",
+                room.Kind == RelayKind.Room && room.Code == "654905" && room.GuestPort == 27201 && room.HostPort == 27200,
+                "g=" + room.GuestPort + " h=" + room.HostPort);
+
+            var join = RelayProtocol.Parse(RelayProtocol.BuildJoin("000000", ""));
+            Check("JOIN 空密码", join.Kind == RelayKind.Join && join.Code == "000000" && join.Password == "");
+            Check("OK 往返客人口",
+                RelayProtocol.Parse(RelayProtocol.BuildOk(27201)) is var okp
+                && okp.Kind == RelayKind.Ok && okp.GuestPort == 27201);
+            Check("LIST/DROP/PING/PONG/ERR 往返",
+                RelayProtocol.Parse(RelayProtocol.BuildList()).Kind == RelayKind.List
+                && RelayProtocol.Parse(RelayProtocol.BuildDrop("123456")).Code == "123456"
+                && RelayProtocol.Parse(RelayProtocol.BuildPing()).Kind == RelayKind.Ping
+                && RelayProtocol.Parse(RelayProtocol.BuildPong()).Kind == RelayKind.Pong
+                && RelayProtocol.Parse(RelayProtocol.BuildError("passwd")).Error == "passwd");
+
+            var rooms = new List<RelayRoomInfo>
+            {
+                new() { Code = "111111", RoomName = "小明的房间", LevelIndex = 7, Players = 2, MaxPlayers = 4, Locked = false },
+                new() { Code = "222222", RoomName = "加密房", LevelIndex = -1, Players = 1, MaxPlayers = 4, Locked = true },
+                new() { Code = "333333", RoomName = "满员房", LevelIndex = 61, Players = 4, MaxPlayers = 4, Locked = false },
+            };
+            var list = RelayProtocol.Parse(RelayProtocol.BuildRooms(rooms));
+            Check("ROOMS 三房往返（含要密码/未知关卡）",
+                list.Kind == RelayKind.Rooms && list.Count == 3 && list.Rooms.Count == 3
+                && list.Rooms[0].RoomName == "小明的房间" && list.Rooms[0].LevelIndex == 7
+                && list.Rooms[1].Locked && list.Rooms[1].LevelIndex == -1
+                && list.Rooms[2].Code == "333333" && list.Rooms[2].Players == 4 && !list.Rooms[2].Locked,
+                "n=" + list.Rooms?.Count);
+            var noRoom = RelayProtocol.Parse(RelayProtocol.BuildRooms(new List<RelayRoomInfo>()));
+            Check("ROOMS 空表解出 0 房", noRoom.Kind == RelayKind.Rooms && noRoom.Count == 0 && noRoom.Rooms.Count == 0);
+
+            Check("隧道登记报文格式（空格分隔，不走 Sep）",
+                RelayProtocol.BuildTunnelRegister("654905", 2) == "PGVZREG 654905 2",
+                RelayProtocol.BuildTunnelRegister("654905", 2));
+
+            Check("Clean 去掉分隔符、逗号、空白与控制字符",
+                RelayProtocol.Clean("a|b,c d\r\n\t中") == "abcd中", "got=" + RelayProtocol.Clean("a|b,c d\r\n\t中"));
+            Check("Clean 截到 24 字符（左列一行画得下）",
+                RelayProtocol.Clean(new string('x', 100)).Length == 24,
+                "len=" + RelayProtocol.Clean(new string('x', 100)).Length);
+            Check("Clean 处理 null 与空串", RelayProtocol.Clean(null) == "" && RelayProtocol.Clean("") == "");
+
+            // 调试时是用 nc/socat 手敲的，大小写不保证
+            Check("动词大小写宽容",
+                RelayProtocol.Parse("host|a|").Kind == RelayKind.Host
+                && RelayProtocol.Parse("join|x|").Kind == RelayKind.Join
+                && RelayProtocol.Parse("LiSt").Kind == RelayKind.List);
+
+            // 只该拿到 Unknown 的畸形输入
+            string[] unknown =
+            {
+                null, "", "GARBAGE", "|", "|||", "ROOM|1", "ROOM", "SEEN|123", "SEEN", "JOIN",
+                "PGVZREG 1 2", new string('摸', 5000), new string('|', 300), "\n\0\r", " rooms|1",
+            };
+            string badDetail = "";
+            foreach (var raw in unknown)
+            {
+                try
+                {
+                    var m = RelayProtocol.Parse(raw);
+                    // " rooms|1" 带前导空格：Trim 后仍认得 Rooms，不算畸形
+                    if (m.Kind != RelayKind.Unknown && raw != " rooms|1")
+                    {
+                        badDetail += " [" + Short(raw) + "->" + m.Kind + "]";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    badDetail += " [" + Short(raw) + " 抛 " + ex.GetType().Name + "]";
+                }
+            }
+            Check("畸形报文只得到 Unknown 且不抛异常", badDetail == "", badDetail);
+
+            // 认得动词但字段是垃圾：必须落到"不可能的端口/关卡值"，0 会被当成真端口
+            var noPort = RelayProtocol.Parse("ROOM|123456|abc|");
+            Check("端口字段非数字时回落 -1（不是 0）",
+                noPort.Kind == RelayKind.Room && noPort.GuestPort == -1 && noPort.HostPort == -1,
+                "g=" + noPort.GuestPort + " h=" + noPort.HostPort);
+            Check("OK 无端口字段回落 -1",
+                RelayProtocol.Parse("OK|xx").GuestPort == -1 && RelayProtocol.Parse("OK").GuestPort == -1);
+            var junkSeen = RelayProtocol.Parse("SEEN|123|a|b|c|d");
+            Check("SEEN 数字字段垃圾时逐项回落",
+                junkSeen.LevelIndex == -1 && junkSeen.Players == 0 && junkSeen.MaxPlayers == 1
+                && junkSeen.Password == "d",
+                "lvl=" + junkSeen.LevelIndex + " p=" + junkSeen.Players + " max=" + junkSeen.MaxPlayers);
+            var bare = RelayProtocol.Parse("HOST");
+            Check("缺字段的动词得到空串而非崩溃",
+                bare.Kind == RelayKind.Host && bare.Name == "" && bare.Password == "");
+            // 声明的房间数与实际条数不符（截包/伪造）：以条数为准，UI 不能按 Count 建控件；
+            // 记录段数不够时必须整条丢掉——留着会在取 f[2..5] 时越界，把这条断言变成"崩掉"而不是"报红"。
+            string roomsJunk = "";
+            int roomsJunkN = -1;
+            try
+            {
+                var shortList = RelayProtocol.Parse("ROOMS|5|1,2");
+                roomsJunkN = shortList.Kind == RelayKind.Rooms ? shortList.Rooms.Count : -2;
+            }
+            catch (Exception ex)
+            {
+                roomsJunk = ex.GetType().Name;
+            }
+            Check("ROOMS 记录不足 6 段时整条丢弃且不抛", roomsJunk.Length == 0 && roomsJunkN == 0,
+                "抛=" + roomsJunk + " n=" + roomsJunkN);
+            Check("ROOMS 多余字段不影响已解出的记录",
+                RelayProtocol.Parse("ROOMS|1|a,b,-1,1,4,x,y,z").Rooms.Count == 1);
+        }
+
+        private static string Short(string s)
+            => s == null ? "<null>" : (s.Length > 10 ? s.Substring(0, 10) + "…" : s);
+
+        // ------------------------------------------------------------ 5. 身份与手改配置
+
+        /// <summary>
+        /// 显示名改从游戏存档取（mPlayerInfo.mName），联机配置里不再有 Nickname；
+        /// 服务器列表来自玩家手改的 JSON，必须在进 UI 之前被洗干净。
+        /// 本会话没跑过游戏循环，_app 为空，走的就是回落分支。
+        /// </summary>
+        private static void TestIdentity()
+        {
+            Console.WriteLine("-- 身份与服务器列表 --");
+            Check("取不到存档名时回落为 玩家（不抛 NullReference）",
+                PGvZOnlineMod.Sync.Session.LocalNick() == "玩家",
+                "got=" + PGvZOnlineMod.Sync.Session.LocalNick());
+
+            string path = Path.Combine(ModEnv.DataDir, "联机配置.json");
+            byte[] backup = File.Exists(path) ? File.ReadAllBytes(path) : null;
+            try
+            {
+                Directory.CreateDirectory(ModEnv.DataDir);
+                File.WriteAllText(path, @"
+{
+  ""Nickname"": ""旧字段，已从配置里删掉"",
+  ""HostPort"": 99999,
+  ""SnapshotHz"": 999,
+  ""CursorHz"": 1,
+  ""ZombieHpPerExtraPlayer"": 99,
+  ""Servers"": [
+    { ""Name"": ""自家中继"", ""Host"": ""47.116.78.238"", ""Port"": 27270 },
+    { ""Name"": """", ""Host"": ""  relay.example.com  "", ""Port"": 27271 },
+    { ""Name"": ""空白地址"", ""Host"": ""   "", ""Port"": 27272 },
+    null,
+    { ""Name"": ""零端口"", ""Host"": ""10.0.0.9"", ""Port"": 0 },
+    { ""Name"": ""越界端口"", ""Host"": ""10.0.0.10"", ""Port"": 70000 },
+    { ""Host"": ""10.0.0.11"", ""Port"": 27277 },
+    { ""Name"": ""第七"", ""Host"": ""10.0.0.12"", ""Port"": 27278 },
+    { ""Name"": ""第八"", ""Host"": ""10.0.0.13"", ""Port"": 27279 },
+    { ""Name"": ""第九"", ""Host"": ""10.0.0.14"", ""Port"": 27280 },
+    { ""Name"": ""第十"", ""Host"": ""10.0.0.15"", ""Port"": 27281 },
+    { ""Name"": ""第十一"", ""Host"": ""10.0.0.16"", ""Port"": 27282 }
+  ]
+}");
+                Check("能重置配置缓存（_config 改名要同步这里）", ResetCachedConfig());
+                var cfg = ModEnv.GetConfig();
+
+                Check("服务器列表截到 8 台", cfg.Servers.Count == 8, "n=" + cfg.Servers.Count);
+                Check("空地址与 null 条目被丢掉（截到 8 台之前先清）",
+                    cfg.Servers.All(s => s != null && s.Host.Length > 0)
+                    && cfg.Servers.All(s => s.Host != "10.0.0.15" && s.Host != "10.0.0.16")
+                    && cfg.Servers[7].Host == "10.0.0.14",
+                    string.Join(",", cfg.Servers.Select(s => s.Host)));
+                Check("地址首尾空白被去掉（否则 Dns 解析直接失败）",
+                    cfg.Servers[1].Host == "relay.example.com", "host=" + cfg.Servers[1].Host);
+                Check("没名字的服务器用地址当显示名",
+                    cfg.Servers[1].Name == "relay.example.com" && cfg.Servers[4].Name == "10.0.0.11",
+                    "name=" + cfg.Servers[1].Name + "/" + cfg.Servers[4].Name);
+                Check("有名字的服务器不被覆盖",
+                    cfg.Servers[0].Name == "自家中继" && cfg.Servers[0].Host == "47.116.78.238",
+                    "name=" + cfg.Servers[0].Name);
+                Check("端口 0 与越界端口回落控制口",
+                    cfg.Servers[2].Port == RelayProtocol.DefaultControlPort
+                    && cfg.Servers[3].Port == RelayProtocol.DefaultControlPort,
+                    "p=" + cfg.Servers[2].Port + "/" + cfg.Servers[3].Port);
+                Check("合法端口原样保留",
+                    cfg.Servers[1].Port == 27271 && cfg.Servers[5].Port == 27278,
+                    "p=" + cfg.Servers[1].Port + "/" + cfg.Servers[5].Port);
+                Check("旧 Nickname 字段被忽略，其余越界值照样回落",
+                    cfg.HostPort == 27150 && cfg.SnapshotHz == 20 && cfg.CursorHz == 10
+                    && Math.Abs(cfg.ZombieHpPerExtraPlayer - 0.35f) < 1e-6,
+                    "port=" + cfg.HostPort + " hz=" + cfg.SnapshotHz + "/" + cfg.CursorHz
+                    + " hp=" + cfg.ZombieHpPerExtraPlayer);
+            }
+            finally
+            {
+                // 成对恢复：这个宿主下次运行（以及本次后面的用例）看到的必须还是原文件
+                try
+                {
+                    if (backup != null)
+                    {
+                        File.WriteAllBytes(path, backup);
+                    }
+                    else if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                    }
+                }
+                catch
+                {
+                }
+                ResetCachedConfig();
+            }
+
+            byte[] after = File.Exists(path) ? File.ReadAllBytes(path) : null;
+            Check("配置用例已把 联机配置.json 恢复原样",
+                (backup == null && after == null) || (backup != null && after != null && backup.SequenceEqual(after)),
+                "exists=" + File.Exists(path));
+            // 恢复后再读一次：拿到的应该是原配置而不是我塞进去的那份脏列表
+            var restored = ModEnv.GetConfig();
+            Check("恢复后重新读取不到测试用的服务器列表",
+                restored.Servers.All(s => s.Host != "10.0.0.14"),
+                "n=" + restored.Servers.Count);
+            if (backup == null)
+            {
+                // 本来没有配置文件时，上面那次读取会顺手落一份默认配置（模组首次运行也一样会落）；
+                // 这里再删掉，保证两次运行看到的是同一个起点。
+                try { File.Delete(path); } catch { }
+                ResetCachedConfig();
+            }
+        }
+
+        private static bool ResetCachedConfig()
+        {
+            var field = typeof(ModEnv).GetField("_config", BindingFlags.NonPublic | BindingFlags.Static);
+            if (field == null)
+            {
+                return false;
+            }
+            field.SetValue(null, null);
+            return true;
         }
 
         private static void TestDetour()

@@ -7,11 +7,24 @@ using Newtonsoft.Json;
 namespace PGvZOnlineMod.Core
 {
     /// <summary>
+    /// 一台跨互联网中继服务器（联机页左列的一项）。
+    /// "局域网"那条不在此列——它走广播与扫段，不依赖任何服务器。
+    /// </summary>
+    public class ServerEntry
+    {
+        public string Name = "";
+        /// <summary>IP 或域名。中继走 UDP，不是 wss/http，这里只写主机部分。</summary>
+        public string Host = "";
+        /// <summary>中继的控制端口（转发端口由服务端在应答里给出）。</summary>
+        public int Port = 27270;
+    }
+
+    /// <summary>
     /// 联机配置（mods/PGvZOnlineMod/联机配置.json）。读不到/损坏时回退默认值并重建。
+    /// 显示名不在这里——用游戏自己的玩家名 mPlayerInfo.mName，联机页不再单独设昵称。
     /// </summary>
     public class OnlineConfig
     {
-        public string Nickname = "玩家";
         public int HostPort = 27150;
         public string LastIp = "127.0.0.1";
         /// <summary>上次手动加入时用的端口（默认与建房端口一致）。</summary>
@@ -25,6 +38,9 @@ namespace PGvZOnlineMod.Core
         /// 0 = 关闭加压。仅主机侧生效（生成时放大，随生成清单下发给各端）。
         /// </summary>
         public float ZombieHpPerExtraPlayer = 0.35f;
+
+        /// <summary>玩家自己添加的中继服务器（联机页左列，"局域网"之外的那些）。</summary>
+        public List<ServerEntry> Servers = new List<ServerEntry>();
     }
 
     /// <summary>
@@ -106,9 +122,33 @@ namespace PGvZOnlineMod.Core
                 Log("配置读取失败，使用默认值: " + ex.Message);
             }
             _config ??= new OnlineConfig();
-            if (string.IsNullOrWhiteSpace(_config.Nickname))
+            // 服务器列表可能来自玩家手改的 JSON：先去掉首尾空白（粘一个 " 1.2.3.4 " 会让
+            // Dns 解析直接失败），脏条目丢掉，最多留 8 台（左列画得下），端口越界回落
+            _config.Servers ??= new List<ServerEntry>();
+            foreach (var s in _config.Servers)
             {
-                _config.Nickname = "玩家";
+                if (s == null)
+                {
+                    continue;
+                }
+                s.Host = (s.Host ?? "").Trim();
+                s.Name = (s.Name ?? "").Trim();
+            }
+            _config.Servers.RemoveAll(s => s == null || s.Host.Length == 0);
+            if (_config.Servers.Count > 8)
+            {
+                _config.Servers.RemoveRange(8, _config.Servers.Count - 8);
+            }
+            foreach (var s in _config.Servers)
+            {
+                if (s.Port < 1024 || s.Port > 65535)
+                {
+                    s.Port = 27270;
+                }
+                if (s.Name.Length == 0)
+                {
+                    s.Name = s.Host;
+                }
             }
             if (_config.HostPort is < 1024 or > 65535)
             {

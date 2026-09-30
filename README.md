@@ -30,7 +30,7 @@ MIT 只覆盖本仓库的这些源码：仓库**不含**游戏可执行文件、
 | 玩家 / 客人 | 4 / 3（`NetMgr.MaxClients`） |
 | 消息类型 | 32（`PacketType` 0..31），可靠事件 + 不可靠快照双通道 |
 | 游戏钩子 | 24（清单见 项目文档 第 6 节） |
-| 离线回归 | VerifyHost 43 项（netId + 关卡表 + 座位门闩 + 全消息往返 + 真 Lidgren 回环 + 真 detour） |
+| 离线回归 | VerifyHost 77 项（netId + 关卡表 + 座位门闩 + 全消息往返 + 中继协议 + 身份/配置清洗 + 真 Lidgren 回环 + 真 detour）；另加中继回环自测 20 项 |
 | 可选关卡 | **65 关**（游戏挑战表 100 条 − 点名排除 35 条，每条理由写得出） |
 | 依赖分发 | Windows 复用游戏自带 Lidgren/Newtonsoft；Android 随模组带副本并启动时加载 |
 
@@ -38,9 +38,10 @@ MIT 只覆盖本仓库的这些源码：仓库**不含**游戏可执行文件、
 
 ```bat
 cd /d D:\植物大战僵尸\WP_PGVZ\my_mods\PGvZOnlineMod
-dotnet build PGvZOnlineMod.sln -c Release           :: 一条命令编两个项目（mod + 回归台）
+dotnet build PGvZOnlineMod.sln -c Release           :: 一条命令编三个项目（mod + 回归台 + 中继）
 dotnet build -c Release                          :: mod → bin\Release\net6.0\PGvZOnlineMod.dll
-dotnet run --project VerifyHost -c Release --no-build :: 离线回归门（43 项，exit 0 = 全过）
+dotnet run --project VerifyHost -c Release --no-build :: 离线回归门（77 项，exit 0 = 全过；-c Release 不能省）
+py -3 RelayServer/selftest.py                    :: 中继回环自测（20 项，不需要云也不需要游戏）
 python 打包.py                                   :: 编译 + 回归 + 打 zip 到 publish\
 ```
 
@@ -67,12 +68,17 @@ MonoMod.RuntimeDetour / IronPython / Newtonsoft（全部 `Private=false`，运�
   局内聊天（Enter / 右上角按钮 / 快捷短语，中文与 Android 软键盘同一条通路）
   ——**这两项尚未游戏内实测**，见 项目文档 第 18 节的验证状态。
 - ⏳ 出怪数量按人数加压、僵尸冰冻/减速状态同步、更多游戏模式。
+- ⏳ 跨互联网联机（**填房间号就进，不装任何 VPN 工具**）：地基已完成——控制协议、
+  中继服务端、服务器列表配置、回环自测；局域网/内外穿透那条不依赖服务器的路子**照原样保留**，
+  两种接入并存。还差联机页重排与 Session 双模接入（主机侧起三条隧道把客人分开），
+  见 `项目文档.md` 第 18 节第十四批。
 - 完整的已知边界与风险清单见 `项目文档.md` 第 16 节。
 
 ## 代码结构
 
-用 `PGvZOnlineMod.sln` 在 VS / Rider 里打开就是两个项目：`PGvZOnlineMod`（模组本体）
-与 `VerifyHost`（离线回归台）。
+用 `PGvZOnlineMod.sln` 在 VS / Rider 里打开就是三个项目：`PGvZOnlineMod`（模组本体）、
+`VerifyHost`（离线回归台）与 `RelayServer`（跨互联网 UDP 中继，单独部署到服务器，
+**不进** `mods\`，也不进发布包）。
 
-`src/{Core,Protocol,Net,Sync,Hooks,Ui}` + `VerifyHost/`（离线回归台），
-逐文件职责与行数见 `项目文档.md` 第 3 节。
+`src/{Core,Protocol,Net,Sync,Hooks,Ui}` + `VerifyHost/`（离线回归台）+ `RelayServer/`（中继），
+逐文件职责与行数见 `项目文档.md` 第 3 节；中继控制协议见第 5.4 节。

@@ -14,9 +14,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 验证宿主是独立工程，不并入 mod 编译 -->
+    <!-- 验证宿主与中继服务端是独立工程；mod 在仓库根上，默认 glob 会把它们也扫进来，必须显式排除 -->
     <Compile Remove="VerifyHost\**" />
     <None Remove="VerifyHost\**" />
+    <Compile Remove="RelayServer\**" />
+    <None Remove="RelayServer\**" />
   </ItemGroup>
 
   <ItemGroup>
