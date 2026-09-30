@@ -47,6 +47,7 @@ namespace PGvZOnlineVerify
             TestHostingSeat();
             TestLoopback();
             TestExtendedPackets();
+            TestDiscoveryBeacon();
             TestRelayProtocol();
             TestIdentity();
             TestDetour();
@@ -726,6 +727,103 @@ namespace PGvZOnlineVerify
                 "move=" + movePlant + " moved=" + plantMoved);
             host.Shutdown();
             client.Shutdown();
+        }
+
+        // ------------------------------------------------------------ 3b. 局域网房间广播
+
+        /// <summary>
+        /// 房间广播走 Lidgren 的发现通道（不是那 32 种消息），联机页那一行"2/2"就来自它。
+        /// 人数是后加的**尾部**字段，所以这里必须同时钉住两件事：
+        ///   · 新主机：四个字段原样到达客人；
+        ///   · 老主机（只写昵称+关卡）：房间仍然要出现，人数读不出来时是 -1（界面显示"人数未知"），
+        ///     而不是抛异常整条丢掉——那会把"对方没升级"放大成"搜不到房"。
+        /// </summary>
+        private static void TestDiscoveryBeacon()
+        {
+            Console.WriteLine("-- 房间广播 --");
+            const int port = 27244;
+            using var host = new NetMgr();
+            if (!host.StartHost(port))
+            {
+                Check("发现测试：主机启动", false, host.Error);
+                return;
+            }
+            bool oldFormat = false;
+            host.DiscoveryResponder = () =>
+            {
+                var m = host.CreateMessage();
+                if (m == null)
+                {
+                    return null;
+                }
+                if (oldFormat)
+                {
+                    m.Write("老主机");      // 老版本 WriteRoomBeacon 的全部字段
+                    m.Write(7);
+                }
+                else
+                {
+                    Packets.WriteRoomBeacon(m, "小明", 7, 2, 4);
+                }
+                return m;
+            };
+
+            // 一轮一个全新的 seeker：Lidgren 的客户端对同一 peer 的重复发现应答不保证再往上抛
+            oldFormat = false;
+            var newRoom = AskOnce(host, port);
+            Check("新主机广播：昵称/关卡/人数四项原样到达",
+                newRoom.nick == "小明" && newRoom.level == 7 && newRoom.players == 2 && newRoom.max == 4,
+                "nick=" + newRoom.nick + " lvl=" + newRoom.level + " p=" + newRoom.players + "/" + newRoom.max);
+
+            oldFormat = true;
+            var oldRoom = AskOnce(host, port);
+            Check("老主机广播：房间仍在，人数落 -1（不是崩也不是 0）",
+                oldRoom.nick == "老主机" && oldRoom.level == 7 && oldRoom.players == -1 && oldRoom.max == -1,
+                "nick=" + oldRoom.nick + " p=" + oldRoom.players + "/" + oldRoom.max);
+
+            host.Shutdown();
+        }
+
+        private static (string nick, int level, int players, int max) AskOnce(NetMgr host, int port)
+        {
+            string nick = null;
+            int level = -9, players = -9, max = -9;
+            string err = null;
+            using var seeker = new NetMgr();
+            if (!seeker.StartDiscoveryPeer())
+            {
+                return (null, -9, -9, -9);
+            }
+            seeker.OnRoomDiscovered += (ip, im) =>
+            {
+                try
+                {
+                    Packets.ReadRoomBeacon(im, out nick, out level, out players, out max);
+                }
+                catch (Exception ex)
+                {
+                    err = ex.GetType().Name + ": " + ex.Message;
+                }
+            };
+            var sw = Stopwatch.StartNew();
+            var lastSend = TimeSpan.Zero;
+            while (nick == null && err == null && sw.Elapsed.TotalSeconds < 6)
+            {
+                if (sw.Elapsed - lastSend > TimeSpan.FromMilliseconds(400))
+                {
+                    lastSend = sw.Elapsed;
+                    seeker.SendDiscoveryTo(new System.Net.IPEndPoint(
+                        System.Net.IPAddress.Loopback, port));
+                }
+                host.Poll();
+                seeker.Poll();
+                Thread.Sleep(1);
+            }
+            if (err != null)
+            {
+                Check("读房间广播不抛异常", false, err);
+            }
+            return (nick ?? "", level, players, max);
         }
 
         // ------------------------------------------------------------ 4. 中继控制协议

@@ -12,35 +12,52 @@ namespace PGvZOnlineMod.Ui
     /// 打开：主菜单 [联机] 按钮按下 → KillGameSelector → mGameScene=Challenge → 挂整页；
     /// 关闭：移除整页 → ShowGameSelector。
     ///
+    /// 浏览页排版照参考图：左列"服务器"（局域网 + 玩家自加的中继 + 手动填 IP），
+    /// 右列"房间列表"（点一条即加入），面板底部一排 添加服务器 / 创建房间 / 刷新，面板外左下"返回"。
+    /// 三个对话框：添加服务器、手动连接、创建房间。
+    ///
     /// 排版两条铁律（都是实机截图里踩出来的）：
     /// 1) NewLawnButton 的贴图按**原始尺寸**绘制（ButtonWidget.DrawImage 传源矩形，不拉伸），
     ///    而标签按 mWidth 居中 —— 把按钮 Resize 成 330/470 宽只会让文字飘到图外面。
-    ///    所以真按钮一律用贴图原始大小（游戏自己也是这样，见 AwardScreen 用 image.mWidth）。
-    /// 2) 需要"整条宽 bar"的地方（房间列表 / 座位行 / 踢出 / 选关下拉）不用按钮控件，
-    ///    改为自绘 + 在本控件 MouseDown 里做命中测试。
+    ///    所以真按钮一律用贴图原始大小；参考图里那种"整条宽 bar"全改成自绘 + 命中测试。
+    /// 2) 横向按 mWidth 居中而不是写死 800：宽屏时 mVirtualWidth 比 800 宽，
+    ///    写死会让整页内容偏左、右边空一条。
     /// </summary>
     public class OnlineLobbyScreen : Widget, ButtonListener
     {
         public const int LobbyButtonId = 200;
 
+        // ------------------------------------------------------------ 控件 id（各段区间互不重叠）
+
         private const int BackId = 100;
-        private const int HostId = 110;
-        private const int JoinId = 111;
-        private const int LevelId = 112;
-        private const int StartId = 113;
-        private const int DisconnectId = 114;
-        private const int ReadyBtnId = 116;
-        private const int KickBtnIdBase = 125;
-        private const int RoomButtonIdBase = 120;
-        private const int RoomButtonCount = 4;
-        private const int LvlPageIdBase = 150; // 下拉的分类行
-        private const int LvlRowIdBase = 160;  // 下拉的关卡条目行
+        private const int AddServerId = 101;
+        private const int CreateRoomId = 102;
+        private const int RefreshId = 103;
+        private const int LevelId = 104;
+        private const int StartId = 105;
+        private const int DisconnectId = 106;
+        private const int ReadyBtnId = 107;
+        private const int DlgOkId = 108;
+        private const int DlgCancelId = 109;
+        private const int PickLevelBtnId = 110;
+
+        private const int KickBtnIdBase = 125;      // 125..127（最多 3 个客人位）
+        private const int LvlPageIdBase = 150;      // 150..155 下拉的分类行
+        private const int LvlRowIdBase = 160;       // 160..163 下拉的关卡条目行
         private const int LvlPrevId = 170;
         private const int LvlNextId = 171;
-        internal const int TabCount = 6;       // 全部 + 五个页签（离线回归会拿它当分类数的上限校验）
-        private const int RowCount = 4;        // 下拉每页显示几关
+        private const int RoomRowIdBase = 180;      // 180..187 房间列表行
+        private const int ServerRowIdBase = 190;    // 190..199 服务器行
+        private const int RemoveServerIdBase = 220; // 220..229 服务器行右侧的"去掉这台"
+        private const int ManualRowId = 240;
+        private const int PwToggleId = 241;
+        internal const int TabCount = 6;            // 全部 + 五个页签（离线回归会拿它当分类数的上限校验）
+        private const int RowCount = 4;             // 下拉每页显示几关
 
-        private enum HitKind { Info, Seat, RoomRow, Kick, Tab, LevelRow, Pager }
+        private const int RoomRowMax = 8;           // 一屏放得下的房间行数
+        private const int ServerRowMax = 10;        // 局域网 + 8 台中继 + 手动一行
+
+        private enum HitKind { Info, Seat, RoomRow, Kick, Tab, LevelRow, Pager, ServerRow, Small, CheckBox }
 
         /// <summary>自绘条目：几何 + 文案 + 点下去等价于按哪个按钮 id（Id 为负＝纯展示）。</summary>
         private struct Hit
@@ -51,20 +68,44 @@ namespace PGvZOnlineMod.Ui
             public bool Selected;
         }
 
+        /// <summary>左列一行：局域网 / 某台中继 / 手动填 IP。</summary>
+        private struct ServerRow
+        {
+            public bool IsLan;
+            public bool IsManual;
+            public string Label;
+            public string Sub;
+            public Core.ServerEntry Entry;
+        }
+
+        private enum Dialog { None, AddServer, ManualJoin, CreateRoom }
+
         private static OnlineLobbyScreen _inst;
         private static NewLawnButton _menuButton;
         private static GameSelector _boundSelector;
 
         private readonly LawnApp _app;
         private NewLawnButton _backButton;
-        private NewLawnButton _hostBtn;
-        private NewLawnButton _joinBtn;
+        private NewLawnButton _addServerBtn;
+        private NewLawnButton _createBtn;
+        private NewLawnButton _refreshBtn;
         private NewLawnButton _levelBtn;
         private NewLawnButton _startBtn;
-        private NewLawnButton _disconnectBtn;
         private NewLawnButton _readyBtn;
-        private IpInputWidget _ipEdit;
+        private NewLawnButton _disconnectBtn;
+        private NewLawnButton _dlgOk;
+        private NewLawnButton _dlgCancel;
+        private NewLawnButton _pickLevelBtn;
+        private IpInputWidget _nameEdit;
+        private IpInputWidget _addrEdit;
         private IpInputWidget _portEdit;
+        private IpInputWidget _pwdEdit;
+
+        private Dialog _dialog = Dialog.None;
+        private int _sel;                       // 左列选中行：0=局域网，1..=中继，最后一条=手动
+        private bool _pwOn;
+        private int _pendingLevel = -1;         // 创建房间对话框里选定、尚未开房的关卡
+        private bool _dropFromDialog;           // 选关下拉是从对话框里点开的
 
         private bool _dropOpen;
         private int _dropPage;
@@ -74,10 +115,22 @@ namespace PGvZOnlineMod.Ui
         private List<int> _dropIndices = new List<int>();
 
         private readonly List<Hit> _hits = new List<Hit>();
+        private readonly List<ServerRow> _serverRows = new List<ServerRow>();
         private long _roomListVersion = -1;
         private bool _roomPhase;
         private int _halfDeltaWidth;
         private int _halfDeltaHeight;
+        private int _lastW = -1;
+        private int _lastH = -1;
+
+        // 浏览页几何（分辨率变了重算，见 ComputeLayout）
+        private int _x0 = 20;
+        private int _cw = 760;
+        private int _panelTop = 58;
+        private int _panelBottom = 526;
+        private int _leftW = 200;
+        private int _rightX = 234;
+        private int _rightW = 546;
 
         public static bool ScreenOpen => _inst != null;
 
@@ -142,7 +195,7 @@ namespace PGvZOnlineMod.Ui
             app.KillGameSelector();
             app.mGameScene = GameScenes.Challenge;
             var screen = new OnlineLobbyScreen(app);
-            screen.Resize(0, 0, app.mWidth, app.mHeight);
+            screen.Resize(0, 0, app.mScreenScales.mVirtualWidth, app.mScreenScales.mVirtualHeight);
             app.mWidgetManager.AddWidget(screen);
             app.mWidgetManager.BringToBack(screen);
             app.mWidgetManager.SetFocus(screen);
@@ -221,41 +274,32 @@ namespace PGvZOnlineMod.Ui
             mClip = false;
             mWantsFocus = true;
 
-            int bw = BtnW, bh = BtnH;
-
             _backButton = MakeButton(BackId, "[BACK_TO_MENU]");
-            _backButton.Resize(18, Constants.BackBufferSize.X - 40, bw, bh);
+            _addServerBtn = MakeButton(AddServerId, "添加服务器");
+            _createBtn = MakeButton(CreateRoomId, "创建房间");
+            _refreshBtn = MakeButton(RefreshId, "刷新");
 
-            // 显示名不再在联机页里设：直接用游戏自己的玩家名（Session.LocalNick）
-
-            // 大厅：手动加入
-            _ipEdit = new IpInputWidget();
-            _ipEdit.Resize(160, 300, 240, 34);
-            _ipEdit.SetText(Core.ModEnv.GetConfig().LastIp ?? "127.0.0.1");
-            AddWidget(_ipEdit);
+            // 对话框控件：一次建好，靠 mVisible 切，避免每帧往 WidgetManager 里塞
+            _nameEdit = new IpInputWidget { MaxLength = 24, AllowAnyChar = true };
+            _addrEdit = new IpInputWidget { MaxLength = 40 };
             _portEdit = new IpInputWidget { MaxLength = 5 };
-            _portEdit.Resize(420, 300, 90, 34);
-            _portEdit.SetText(Core.ModEnv.GetConfig().LastPort.ToString());
+            _pwdEdit = new IpInputWidget { MaxLength = 24, AllowAnyChar = true };
+            AddWidget(_nameEdit);
+            AddWidget(_addrEdit);
             AddWidget(_portEdit);
-            _hostBtn = MakeButton(HostId, "建立房间");
-            _hostBtn.Resize(160, 346, bw, bh);
-            _joinBtn = MakeButton(JoinId, "加入房间");
-            _joinBtn.Resize(170 + bw, 346, bw, bh);
+            AddWidget(_pwdEdit);
+            _dlgOk = MakeButton(DlgOkId, "添加");
+            _dlgCancel = MakeButton(DlgCancelId, "取消");
+            _pickLevelBtn = MakeButton(PickLevelBtnId, "选择关卡");
 
             // 房间内：真按钮一律贴图原始尺寸，宽 bar 全部自绘
             _levelBtn = MakeButton(LevelId, "选关");
-            _levelBtn.Resize(160, 232, bw, bh);
-            _levelBtn.mVisible = false;
             _startBtn = MakeButton(StartId, "开始游戏");
-            _startBtn.Resize(160, 280, bw, bh);
-            _startBtn.mVisible = false;
             _readyBtn = MakeButton(ReadyBtnId, "准备");
-            _readyBtn.Resize(160, 280, bw, bh);
-            _readyBtn.mVisible = false;
             _disconnectBtn = MakeButton(DisconnectId, "离开房间");
-            _disconnectBtn.Resize(170 + bw, 280, bw, bh);
-            _disconnectBtn.mVisible = false;
 
+            ComputeLayout();
+            ApplyLayout();
             RefreshUi();
         }
 
@@ -271,6 +315,128 @@ namespace PGvZOnlineMod.Ui
             return b;
         }
 
+        // ------------------------------------------------------------ 几何
+
+        private void ComputeLayout()
+        {
+            int w = mWidth, h = mHeight;
+            _cw = Math.Min(w - 32, 760);
+            _x0 = (w - _cw) / 2;
+            if (_x0 < 8)
+            {
+                _x0 = 8;
+            }
+            _panelTop = 58;
+            _panelBottom = h - 74;
+            if (_panelBottom < _panelTop + 240)
+            {
+                _panelBottom = _panelTop + 240;
+            }
+            _leftW = 200;
+            _rightX = _x0 + _leftW + 14;
+            _rightW = _x0 + _cw - _rightX;
+            if (_rightW < 220)
+            {
+                _rightW = Math.Max(160, w - _rightX - 8);
+            }
+        }
+
+        private int ButtonRowY => _panelBottom - BtnH - 8;
+        private int ListTopY => _panelTop + 34;
+
+        /// <summary>把真按钮摆到布局上；分辨率变了（宽屏切换）要重算一遍。</summary>
+        private void ApplyLayout()
+        {
+            int bw = BtnW, bh = BtnH;
+            _backButton.Resize(_x0, _panelBottom + 10, bw, bh);
+            _addServerBtn.Resize(_x0 + (_leftW - bw) / 2, ButtonRowY, bw, bh);
+            _createBtn.Resize(_rightX + _rightW / 2 - bw - 5, ButtonRowY, bw, bh);
+            _refreshBtn.Resize(_rightX + _rightW / 2 + 5, ButtonRowY, bw, bh);
+
+            // 房间内那一排沿用旧坐标（已实机验过），只跟着横向居中走
+            int rowX = _x0 + 120;
+            _levelBtn.Resize(rowX, 232, bw, bh);
+            _startBtn.Resize(rowX, 280, bw, bh);
+            _readyBtn.Resize(rowX, 280, bw, bh);
+            _disconnectBtn.Resize(rowX + bw + 10, 280, bw, bh);
+        }
+
+        private void ComputeDialogRect(out int dx, out int dy, out int dw, out int dh)
+        {
+            dw = Math.Min(500, mWidth - 40);
+            int rows = _dialog switch
+            {
+                Dialog.AddServer => 3,
+                Dialog.ManualJoin => 2,
+                Dialog.CreateRoom => 2,
+                _ => 1,
+            };
+            dh = 70 + rows * 74 + BtnH + 30;
+            if (dh > mHeight - 40)
+            {
+                dh = mHeight - 40;
+            }
+            dx = (mWidth - dw) / 2;
+            dy = (mHeight - dh) / 2;
+        }
+
+        private void LayoutDialog()
+        {
+            if (_dialog == Dialog.None)
+            {
+                return;
+            }
+            ComputeDialogRect(out int dx, out int dy, out int dw, out int dh);
+            int bw = BtnW, bh = BtnH;
+            _dlgOk.Resize(dx + dw / 2 - bw - 8, dy + dh - bh - 18, bw, bh);
+            _dlgCancel.Resize(dx + dw / 2 + 8, dy + dh - bh - 18, bw, bh);
+            _pickLevelBtn.Resize(dx + dw - bw - 24, dy + 58, bw, bh);
+
+            int fieldX = dx + 24, fieldW = dw - 48;
+            switch (_dialog)
+            {
+                case Dialog.AddServer:
+                    _nameEdit.Resize(fieldX, dy + 62, fieldW, 32);
+                    _addrEdit.Resize(fieldX, dy + 136, fieldW, 32);
+                    _portEdit.Resize(fieldX, dy + 210, fieldW, 32);
+                    break;
+                case Dialog.ManualJoin:
+                    _addrEdit.Resize(fieldX, dy + 62, fieldW, 32);
+                    _portEdit.Resize(fieldX, dy + 136, fieldW, 32);
+                    break;
+                case Dialog.CreateRoom:
+                    _pwdEdit.Resize(fieldX, dy + 164, fieldW, 32);
+                    break;
+            }
+        }
+
+        // ------------------------------------------------------------ 左列服务器
+
+        private void RebuildServerRows()
+        {
+            _serverRows.Clear();
+            _serverRows.Add(new ServerRow { IsLan = true, Label = "局域网", Sub = "同网段/热点，自动搜房" });
+            foreach (var s in Core.ModEnv.GetConfig().Servers)
+            {
+                if (_serverRows.Count >= ServerRowMax - 1)
+                {
+                    break;
+                }
+                _serverRows.Add(new ServerRow { Entry = s, Label = s.Name, Sub = s.Host + ":" + s.Port });
+            }
+            _serverRows.Add(new ServerRow { IsManual = true, Label = "手动填 IP…", Sub = "虚拟网 / 内外穿透地址" });
+            if (_sel >= _serverRows.Count)
+            {
+                _sel = 0;
+            }
+        }
+
+        private ServerRow SelectedRow =>
+            _sel >= 0 && _sel < _serverRows.Count ? _serverRows[_sel] : default;
+
+        private bool SelectedIsLan => _sel == 0;
+        private bool SelectedIsManual => _sel > 0 && _sel >= _serverRows.Count - 1;
+
         // ------------------------------------------------------------ 状态刷新（同时重建自绘条目）
 
         private void RefreshUi()
@@ -281,11 +447,19 @@ namespace PGvZOnlineMod.Ui
             _roomPhase = room;
             _hits.Clear();
 
-            _hostBtn.mVisible = !room;
-            _joinBtn.mVisible = !room;
-            _ipEdit.mVisible = !room;
-            _portEdit.mVisible = !room;
-            _disconnectBtn.mVisible = room;
+            if (room && _dialog != Dialog.None)
+            {
+                // 已经进房/在连了，浏览页的对话框没有意义（建房与手动连接都已落地）
+                CloseDialog();
+                return;
+            }
+
+            _backButton.mVisible = true;
+            _addServerBtn.mVisible = !room;
+            // 这一批只有"局域网"这一条路真能建房/进房：选中继时把创建房间隐掉，
+            // 免得按下去悄悄开了个局域网房（面板里那行字会说明还差什么）
+            _createBtn.mVisible = !room && SelectedIsLan;
+            _refreshBtn.mVisible = !room;
 
             bool canPick = room && host && connected;
             if (!canPick)
@@ -300,9 +474,29 @@ namespace PGvZOnlineMod.Ui
                 _readyBtn.mLabel = Sync.Session.AmRoomReady ? "取消准备" : "准备";
             }
 
-            if (!room)
+            bool dlg = _dialog != Dialog.None;
+            _dlgOk.mVisible = dlg;
+            _dlgCancel.mVisible = dlg;
+            _dlgOk.mLabel = DialogOkLabel;
+            _pickLevelBtn.mVisible = _dialog == Dialog.CreateRoom;
+            _nameEdit.mVisible = _dialog == Dialog.AddServer;
+            _addrEdit.mVisible = _dialog == Dialog.AddServer || _dialog == Dialog.ManualJoin;
+            _portEdit.mVisible = _addrEdit.mVisible;
+            _pwdEdit.mVisible = _dialog == Dialog.CreateRoom && _pwOn;
+
+            if (dlg)
             {
-                BuildLobbyHits();
+                LayoutDialog();
+                BuildDialogHits();
+            }
+            else if (_dropOpen)
+            {
+                BuildDropdownHits();
+            }
+            else if (!room)
+            {
+                RebuildServerRows();
+                BuildBrowseHits();
             }
             else
             {
@@ -311,22 +505,82 @@ namespace PGvZOnlineMod.Ui
             MarkDirty();
         }
 
-        /// <summary>局域网房间条目：自绘整条 bar，点一条即加入。</summary>
-        private void BuildLobbyHits()
+        /// <summary>浏览页：左列服务器行 + 右列房间行。</summary>
+        private void BuildBrowseHits()
         {
-            for (int i = 0; i < RoomButtonCount && i < Sync.Session.RoomList.Count; i++)
+            for (int i = 0; i < _serverRows.Count && i < ServerRowMax; i++)
             {
+                var r = _serverRows[i];
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.ServerRow,
+                    X = _x0 + 10,
+                    Y = ListTopY + i * 35,
+                    W = _leftW - 20,
+                    H = 30,
+                    Id = r.IsManual ? ManualRowId : ServerRowIdBase + i,
+                    Main = Clip(r.Label, 11),
+                    Right = r.Sub,
+                    Selected = i == _sel,
+                });
+                // 只有玩家自己加的中继能删；行选中时才露出"×"，平时不占视觉
+                if (r.Entry != null && i == _sel)
+                {
+                    _hits.Add(new Hit
+                    {
+                        Kind = HitKind.Small,
+                        X = _x0 + _leftW - 32,
+                        Y = ListTopY + i * 35 + 4,
+                        W = 22,
+                        H = 22,
+                        Id = RemoveServerIdBase + i,
+                        Main = "×",
+                    });
+                }
+            }
+
+            if (!SelectedIsLan)
+            {
+                return; // 中继/手动两态没有"列表"可点：手动那行点了直接弹框
+            }
+            int n = Sync.Session.RoomList.Count;
+            for (int i = 0; i < RoomRowMax && i < n; i++)
+            {
+                var room = Sync.Session.RoomList[i];
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.RoomRow,
-                    X = 160,
-                    Y = 112 + i * 38,
-                    W = 480,
-                    H = 34,
-                    Id = RoomButtonIdBase + i,
-                    Main = Clip(Sync.Session.RoomList[i].DisplayText, 34),
+                    X = _rightX + 10,
+                    Y = ListTopY + i * 44,
+                    W = _rightW - 20,
+                    H = 38,
+                    Id = RoomRowIdBase + i,
+                    Main = Clip(room.DisplayText, 28),
+                    Right = room.Ip + ":" + room.Port,
                 });
             }
+        }
+
+        private void BuildDialogHits()
+        {
+            if (_dialog != Dialog.CreateRoom)
+            {
+                return;
+            }
+            ComputeDialogRect(out int dx, out int dy, out _, out _);
+            // 参考图里有"使用密码"。局域网建房这套没有密码机制（同一网段搜到就能进），
+            // 所以先按图把它画出来但点不动；走中继建房那一批接上才真的生效。
+            _hits.Add(new Hit
+            {
+                Kind = HitKind.CheckBox,
+                X = dx + 24,
+                Y = dy + 128,
+                W = 260,
+                H = 26,
+                Id = SelectedIsLan ? -1 : PwToggleId,
+                Main = SelectedIsLan ? "使用密码（走中继建房时可用）" : "使用密码",
+                Selected = _pwOn,
+            });
         }
 
         private void BuildRoomHits(bool host, bool connected)
@@ -357,7 +611,7 @@ namespace PGvZOnlineMod.Ui
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.Seat,
-                    X = 160,
+                    X = _x0 + 120,
                     Y = 52 + ps * 40,
                     W = 390,
                     H = 36,
@@ -372,7 +626,7 @@ namespace PGvZOnlineMod.Ui
                     _hits.Add(new Hit
                     {
                         Kind = HitKind.Kick,
-                        X = 556,
+                        X = _x0 + 516,
                         Y = 58 + ps * 40,
                         W = 76,
                         H = 24,
@@ -386,7 +640,7 @@ namespace PGvZOnlineMod.Ui
             {
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Info, X = 172 + BtnW, Y = 244, W = 460, H = 20, Id = -1,
+                    Kind = HitKind.Info, X = _x0 + 132 + BtnW, Y = 244, W = 460, H = 20, Id = -1,
                     Main = "当前：" + level.FullLabel,
                 });
             }
@@ -394,13 +648,13 @@ namespace PGvZOnlineMod.Ui
             {
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Info, X = 160, Y = 244, W = 480, H = 20, Id = -1,
+                    Kind = HitKind.Info, X = _x0 + 120, Y = 244, W = 480, H = 20, Id = -1,
                     Main = "关卡：" + level.FullLabel + "（由主机选择）",
                 });
             }
             _hits.Add(new Hit
             {
-                Kind = HitKind.Info, X = 160, Y = 328, W = 480, H = 16, Id = -1,
+                Kind = HitKind.Info, X = _x0 + 120, Y = 328, W = 480, H = 16, Id = -1,
                 Main = Sync.Session.LevelRuleHint(level.Mode),
             });
             if (host && connected
@@ -408,7 +662,7 @@ namespace PGvZOnlineMod.Ui
             {
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Info, X = 160, Y = 346, W = 480, H = 16, Id = -1,
+                    Kind = HitKind.Info, X = _x0 + 120, Y = 346, W = 480, H = 16, Id = -1,
                     Main = "对方一直搜不到本机？防火墙请允许『专用+公用』，或把热点网络设为专用",
                 });
             }
@@ -421,7 +675,7 @@ namespace PGvZOnlineMod.Ui
         private void JumpToSelectedLevel()
         {
             _dropFilters ??= Sync.Session.LevelPageFilters();
-            int sel = Sync.Session.ClampLevelIndex(Sync.Session.SelectedLevelIndex);
+            int sel = Sync.Session.ClampLevelIndex(PendingOrCurrent());
             for (int f = 1; f < _dropFilters.Count; f++)
             {
                 int pos = Sync.Session.LevelIndicesOfPage(_dropFilters[f]).IndexOf(sel);
@@ -437,6 +691,9 @@ namespace PGvZOnlineMod.Ui
             _dropPage = inAll >= 0 ? inAll / RowCount : 0;
         }
 
+        private int PendingOrCurrent()
+            => _pendingLevel >= 0 ? _pendingLevel : Sync.Session.SelectedLevelIndex;
+
         /// <summary>选关下拉：分类 tab + 关卡条目 + 翻页。全部自绘，不依赖按钮控件。</summary>
         private void BuildDropdownHits()
         {
@@ -451,7 +708,7 @@ namespace PGvZOnlineMod.Ui
             {
                 _dropPage = 0;
             }
-            int selected = Sync.Session.ClampLevelIndex(Sync.Session.SelectedLevelIndex);
+            int selected = Sync.Session.ClampLevelIndex(PendingOrCurrent());
 
             for (int i = 0; i < _dropFilters.Count && i < TabCount; i++)
             {
@@ -502,11 +759,160 @@ namespace PGvZOnlineMod.Ui
             }
         }
 
+        // ------------------------------------------------------------ 对话框开关
+
+        private void OpenDialog(Dialog d)
+        {
+            _dialog = d;
+            _dropOpen = false;
+            _dropFromDialog = false;
+            var cfg = Core.ModEnv.GetConfig();
+            switch (d)
+            {
+                case Dialog.AddServer:
+                    _nameEdit.SetText("");
+                    _addrEdit.SetText("");
+                    _portEdit.SetText(Protocol.RelayProtocol.DefaultControlPort.ToString());
+                    Focus(_nameEdit);
+                    break;
+                case Dialog.ManualJoin:
+                    _addrEdit.SetText(cfg.LastIp ?? "127.0.0.1");
+                    _portEdit.SetText(cfg.LastPort.ToString());
+                    Focus(_addrEdit);
+                    break;
+                case Dialog.CreateRoom:
+                    _pendingLevel = Sync.Session.ClampLevelIndex(Sync.Session.SelectedLevelIndex);
+                    _pwdEdit.SetText("");
+                    _pwOn = false;
+                    break;
+            }
+            RefreshUi();
+        }
+
+        private void CloseDialog()
+        {
+            _dialog = Dialog.None;
+            _dropFromDialog = false;
+            RefreshUi();
+        }
+
+        private void Focus(Widget w)
+        {
+            try
+            {
+                _app?.mWidgetManager?.SetFocus(w);
+            }
+            catch
+            {
+            }
+        }
+
+        /// <summary>对话框标题与真按钮文字（同一个按钮在三个对话框里干三件事）。</summary>
+        private string DialogTitle => _dialog switch
+        {
+            Dialog.AddServer => "添加服务器",
+            Dialog.ManualJoin => "手动连接",
+            Dialog.CreateRoom => "创建房间",
+            _ => "",
+        };
+
+        private string DialogOkLabel => _dialog switch
+        {
+            Dialog.AddServer => "添加",
+            Dialog.ManualJoin => "连接",
+            Dialog.CreateRoom => "创建",
+            _ => "确定",
+        };
+
+        private void ConfirmDialog()
+        {
+            switch (_dialog)
+            {
+                case Dialog.AddServer:
+                    AddServerFromDialog();
+                    break;
+                case Dialog.ManualJoin:
+                    JoinFromDialog();
+                    break;
+                case Dialog.CreateRoom:
+                    CreateRoomFromDialog();
+                    break;
+            }
+        }
+
+        private void AddServerFromDialog()
+        {
+            string host = _addrEdit.Text.Trim();
+            if (host.Length == 0)
+            {
+                Sync.Session.SetStatus("服务器地址不能为空", true);
+                return;
+            }
+            var cfg = Core.ModEnv.GetConfig();
+            var entry = new Core.ServerEntry
+            {
+                Name = _nameEdit.Text.Trim(),
+                Host = host,
+                Port = ParsePortField() ?? Protocol.RelayProtocol.DefaultControlPort,
+            };
+            if (entry.Name.Length == 0)
+            {
+                entry.Name = entry.Host;
+            }
+            cfg.Servers.Add(entry);
+            Core.ModEnv.SaveConfig();
+            RebuildServerRows();
+            _sel = Math.Max(1, Math.Min(cfg.Servers.Count, _serverRows.Count - 2));
+            CloseDialog();
+            Sync.Session.SetStatus("已添加中继：" + entry.Name, false);
+            Core.ModEnv.Log("联机页添加服务器 " + entry.Host + ":" + entry.Port);
+        }
+
+        private int? ParsePortField()
+        {
+            if (int.TryParse(_portEdit.Text.Trim(), out int port) && port >= 1024 && port <= 65535)
+            {
+                return port;
+            }
+            return null;
+        }
+
+        private void JoinFromDialog()
+        {
+            string ip = _addrEdit.Text.Trim();
+            if (ip.Length == 0)
+            {
+                Sync.Session.SetStatus("地址不能为空", true);
+                return;
+            }
+            var cfg = Core.ModEnv.GetConfig();
+            cfg.LastIp = ip;
+            int? port = ParsePortField();
+            if (port.HasValue)
+            {
+                cfg.LastPort = port.Value;
+            }
+            Core.ModEnv.SaveConfig();
+            CloseDialog();
+            Sync.Session.StartJoining(_app, ip, port ?? cfg.LastPort);
+        }
+
+        private void CreateRoomFromDialog()
+        {
+            int picked = PendingOrCurrent();
+            CloseDialog();
+            Sync.Session.StartHosting(_app);
+            _pendingLevel = -1;
+            // 建房之前 HostSetLevel 会因"还不是主机"直接返回，所以顺序必须是先建房再落地关卡
+            Sync.Session.HostSetLevel(picked);
+        }
+
         // ------------------------------------------------------------ 帧更新（镜像 ChallengeScreen.UpdateScreen）
 
         /// <summary>
         /// 每帧把自身 Resize 到虚拟尺寸（含宽屏 letterbox）并重算外扩量——
         /// 背景 Box 用 -halfDelta 起笔铺满整个窗口，消除内容区外的黑边。
+        /// 尺寸变了要重排真按钮，否则宽屏切换后按钮还停在旧坐标。
         /// </summary>
         public override void Update()
         {
@@ -514,6 +920,14 @@ namespace PGvZOnlineMod.Ui
             Resize(mX, mY, _app.mScreenScales.mVirtualWidth, _app.mScreenScales.mVirtualHeight);
             _halfDeltaWidth = (mWidth - Constants.BOARD_WIDTH) / 2;
             _halfDeltaHeight = (mHeight - Constants.BOARD_HEIGHT) / 2;
+            if (mWidth != _lastW || mHeight != _lastH)
+            {
+                _lastW = mWidth;
+                _lastH = mHeight;
+                ComputeLayout();
+                ApplyLayout();
+                RefreshUi();
+            }
             if (_roomListVersion != Sync.Session.RoomListVersion)
             {
                 _roomListVersion = Sync.Session.RoomListVersion;
@@ -531,32 +945,29 @@ namespace PGvZOnlineMod.Ui
                 s_drawImageBox(g, new TRect(-_halfDeltaWidth, -_halfDeltaHeight, mWidth, mHeight),
                     AtlasResources.IMAGE_ALMANAC_ROUNDED_OUTLINE);
 
-                Text(g, "植物娘联机", 400, 22, Resources.FONT_DWARVENTODCRAFT15,
+                Text(g, "多人联机", mWidth / 2, 20, Resources.FONT_DWARVENTODCRAFT15,
                     new SexyColor(220, 220, 220), DrawStringJustification.Center);
 
-                if (!_roomPhase)
+                if (_dropOpen)
                 {
-                    DrawLobby(g);
+                    DrawDropdown(g);
                 }
-                else if (_dropOpen)
+                else if (!_roomPhase)
                 {
-                    // 下拉面板底：盖住座位区（经典下拉行为），条目随后由 DrawHits 画在上面
-                    g.SetColor(new SexyColor(24, 28, 20, 246));
-                    g.FillRect(158, 50, 484, 178);
-                    g.SetColor(new SexyColor(170, 220, 150, 220));
-                    g.DrawRect(158, 50, 484, 178);
-                    Text(g, "第 " + (_dropPage + 1) + "/" + _dropPages + " 页 · 共 " + _dropIndices.Count + " 关",
-                        352, 206, Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
-                    Text(g, "点一条即选定", 626, 206, Resources.FONT_BRIANNETOD12,
-                        new SexyColor(150, 160, 150), DrawStringJustification.Right);
+                    DrawBrowse(g);
                 }
 
                 DrawHits(g);
 
+                if (_dialog != Dialog.None)
+                {
+                    DrawDialog(g);
+                }
+
                 string status = Sync.Session.StatusText;
                 if (!string.IsNullOrEmpty(status))
                 {
-                    Text(g, status, 400, 462, Resources.FONT_BRIANNETOD16,
+                    Text(g, Clip(status, 46), mWidth / 2, _panelBottom + 16, Resources.FONT_BRIANNETOD16,
                         Sync.Session.StatusIsError ? new SexyColor(255, 120, 100) : new SexyColor(160, 255, 160),
                         DrawStringJustification.Center);
                 }
@@ -569,21 +980,109 @@ namespace PGvZOnlineMod.Ui
             }
         }
 
-        private void DrawLobby(Graphics g)
+        private void DrawDropdown(Graphics g)
         {
-            Text(g, "你的昵称：" + Sync.Session.LocalNick() + "（取游戏存档里的名字）",
-                160, 58, Resources.FONT_BRIANNETOD16, new SexyColor(200, 200, 200));
-            Text(g, "局域网房间（点一条加入）", 160, 100, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
-            if (Sync.Session.RoomList.Count == 0)
+            // 下拉面板底：盖住它下面的内容（经典下拉行为），条目随后由 DrawHits 画在上面
+            g.SetColor(new SexyColor(24, 28, 20, 246));
+            g.FillRect(158, 50, 484, 178);
+            g.SetColor(new SexyColor(170, 220, 150, 220));
+            g.DrawRect(158, 50, 484, 178);
+            Text(g, "第 " + (_dropPage + 1) + "/" + _dropPages + " 页 · 共 " + _dropIndices.Count + " 关",
+                352, 206, Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
+            Text(g, "点一条即选定", 626, 206, Resources.FONT_BRIANNETOD12,
+                new SexyColor(150, 160, 150), DrawStringJustification.Right);
+        }
+
+        private void DrawBrowse(Graphics g)
+        {
+            Panel(g, _x0, _panelTop, _leftW, _panelBottom - _panelTop);
+            Panel(g, _rightX, _panelTop, _rightW, _panelBottom - _panelTop);
+            Text(g, "服务器", _x0 + _leftW / 2, _panelTop + 8, Resources.FONT_DWARVENTODCRAFT15,
+                new SexyColor(255, 244, 200), DrawStringJustification.Center);
+            Text(g, "房间列表", _rightX + _rightW / 2, _panelTop + 8, Resources.FONT_DWARVENTODCRAFT15,
+                new SexyColor(255, 244, 200), DrawStringJustification.Center);
+
+            int rooms = Sync.Session.RoomList.Count;
+            Text(g, SelectedIsLan ? "发现 " + rooms + " 个房间" : "选择左边的服务器",
+                mWidth / 2, 42, Resources.FONT_BRIANNETOD16, new SexyColor(235, 235, 225),
+                DrawStringJustification.Center);
+
+            if (SelectedIsLan)
             {
-                Text(g, "正在搜索…（对方点[建立房间]后几秒内出现）", 400, 130,
-                    Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+                if (rooms == 0)
+                {
+                    Text(g, "正在搜索…（对方点[创建房间]后几秒内出现）",
+                        _rightX + _rightW / 2, ListTopY + 26, Resources.FONT_BRIANNETOD12,
+                        new SexyColor(255, 240, 210), DrawStringJustification.Center);
+                }
             }
-            Text(g, "手动加入（填对方 IP 和端口）", 160, 284, Resources.FONT_BRIANNETOD16, new SexyColor(220, 220, 220));
-            Text(g, "搜不到房间？Windows 防火墙允许『专用+公用』（手机热点属公用）", 400, 404,
-                Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
-            Text(g, "跨互联网：双方先连同一个虚拟局域网（ZeroTier/Tailscale），再填虚拟网 IP", 400, 420,
-                Resources.FONT_BRIANNETOD12, new SexyColor(150, 150, 160), DrawStringJustification.Center);
+            else if (SelectedIsManual)
+            {
+                Text(g, "点上面那一行填对方地址：虚拟局域网（ZeroTier/Tailscale）、",
+                    _rightX + 14, ListTopY + 10, Resources.FONT_BRIANNETOD12, new SexyColor(255, 240, 210));
+                Text(g, "内外穿透的地址、热点里的局域网 IP 都走这条，不经过任何服务器。",
+                    _rightX + 14, ListTopY + 28, Resources.FONT_BRIANNETOD12, new SexyColor(255, 240, 210));
+            }
+            else
+            {
+                var r = SelectedRow;
+                Text(g, "已选中继：" + r.Label + "（" + r.Sub + "）",
+                    _rightX + 14, ListTopY + 10, Resources.FONT_BRIANNETOD16, new SexyColor(255, 244, 200));
+                Text(g, "通过中继建房/找房下一批接入；现在请先选『局域网』。",
+                    _rightX + 14, ListTopY + 34, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
+                Text(g, "这台中继已经存进配置，选中它不会改动任何东西。",
+                    _rightX + 14, ListTopY + 52, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
+            }
+
+            Text(g, "你的昵称：" + Sync.Session.LocalNick() + "（取游戏存档里的名字）",
+                _x0 + 4, _panelBottom + 34, Resources.FONT_BRIANNETOD12, new SexyColor(170, 180, 170));
+        }
+
+        private static void Panel(Graphics g, int x, int y, int w, int h)
+        {
+            g.SetColor(new SexyColor(140, 96, 58, 235));
+            g.FillRect(x, y, w, h);
+            g.SetColor(new SexyColor(74, 48, 28, 235));
+            g.DrawRect(x, y, w, h);
+        }
+
+        private void DrawDialog(Graphics g)
+        {
+            ComputeDialogRect(out int dx, out int dy, out int dw, out int dh);
+            g.SetColor(new SexyColor(0, 0, 0, 150));
+            g.FillRect(0, 0, mWidth, mHeight);
+            Panel(g, dx, dy, dw, dh);
+            g.SetColor(new SexyColor(255, 190, 110, 220));
+            g.DrawRect(dx - 1, dy - 1, dw + 2, dh + 2);
+            Text(g, DialogTitle, dx + dw / 2, dy + 12, Resources.FONT_DWARVENTODCRAFT15,
+                new SexyColor(255, 244, 170), DrawStringJustification.Center);
+
+            var label = new SexyColor(255, 232, 170);
+            switch (_dialog)
+            {
+                case Dialog.AddServer:
+                    Text(g, "服务器名称", dx + 24, dy + 42, Resources.FONT_BRIANNETOD12, label);
+                    Text(g, "服务器地址（IP 或域名）", dx + 24, dy + 116, Resources.FONT_BRIANNETOD12, label);
+                    Text(g, "端口（中继控制口）", dx + 24, dy + 190, Resources.FONT_BRIANNETOD12, label);
+                    break;
+                case Dialog.ManualJoin:
+                    Text(g, "对方地址（IP / 虚拟网 / 穿透地址）", dx + 24, dy + 42,
+                        Resources.FONT_BRIANNETOD12, label);
+                    Text(g, "端口（主机建房端口，双方要一致）", dx + 24, dy + 116,
+                        Resources.FONT_BRIANNETOD12, label);
+                    break;
+                case Dialog.CreateRoom:
+                    Text(g, "关卡", dx + 24, dy + 42, Resources.FONT_BRIANNETOD12, label);
+                    int li = Sync.Session.ClampLevelIndex(PendingOrCurrent());
+                    Text(g, Clip(Sync.Session.Levels[li].FullLabel, 16), dx + 24, dy + 66,
+                        Resources.FONT_BRIANNETOD16, new SexyColor(240, 240, 235));
+                    if (SelectedIsLan)
+                    {
+                        Text(g, "局域网建房不需要密码：同一网段里搜到房间的人就能进来", dx + 24, dy + 160,
+                            Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
+                    }
+                    break;
+            }
         }
 
         private static void Text(Graphics g, string s, int x, int y, Font font, SexyColor color,
@@ -606,20 +1105,36 @@ namespace PGvZOnlineMod.Ui
                         g.DrawString(h.Main, h.X, h.Y);
                         break;
 
-                    case HitKind.Seat:
-                        DrawSeat(g, h, font16, font12);
+                    case HitKind.ServerRow:
+                        DrawServerRow(g, h, font16, font12);
                         break;
 
                     case HitKind.RoomRow:
-                        Bar(g, h, new SexyColor(52, 58, 46, 215), new SexyColor(150, 214, 255, 190));
+                        Bar(g, h, new SexyColor(48, 34, 26, 235), new SexyColor(24, 16, 12, 220));
                         g.SetFont(font16);
-                        g.SetColor(new SexyColor(235, 235, 225));
-                        g.DrawString(h.Main, h.X + 10, h.Y + 9);
+                        g.SetColor(new SexyColor(238, 232, 220));
+                        g.DrawString(h.Main, h.X + 10, h.Y + 11);
+                        g.SetFont(font12);
+                        g.SetColor(new SexyColor(215, 195, 165));
+                        g.DrawString(h.Right, h.X + h.W - 8 - (int)font12.StringWidth(h.Right), h.Y + 13);
+                        break;
+
+                    case HitKind.Seat:
+                        DrawSeat(g, h, font16, font12);
                         break;
 
                     case HitKind.Kick:
                         Centered(g, h, font12, new SexyColor(74, 44, 40, 220),
                             new SexyColor(255, 150, 130, 170), new SexyColor(255, 200, 180));
+                        break;
+
+                    case HitKind.Small:
+                        Centered(g, h, font16, new SexyColor(96, 44, 40, 230),
+                            new SexyColor(255, 170, 150, 200), new SexyColor(255, 230, 220));
+                        break;
+
+                    case HitKind.CheckBox:
+                        DrawCheckBox(g, h, font16);
                         break;
 
                     case HitKind.Tab:
@@ -645,6 +1160,41 @@ namespace PGvZOnlineMod.Ui
                         break;
                 }
             }
+        }
+
+        /// <summary>服务器行：参考图里是石头色按钮，这里自绘成同一种观感（贴图不能拉伸）。</summary>
+        private static void DrawServerRow(Graphics g, Hit h, Font font16, Font font12)
+        {
+            Bar(g, h,
+                h.Selected ? new SexyColor(176, 180, 190, 240) : new SexyColor(122, 126, 136, 230),
+                h.Selected ? new SexyColor(255, 240, 170, 230) : new SexyColor(58, 60, 66, 220));
+            g.SetFont(font16);
+            g.SetColor(new SexyColor(28, 96, 34));
+            g.DrawString(h.Main, h.X + (h.W - (int)font16.StringWidth(h.Main)) / 2, h.Y + 7);
+            if (h.Selected && !string.IsNullOrEmpty(h.Right))
+            {
+                g.SetFont(font12);
+                g.SetColor(new SexyColor(46, 44, 44));
+                g.DrawString(Clip(h.Right, 22), h.X + 2, h.Y + h.H + 1);
+            }
+        }
+
+        private static void DrawCheckBox(Graphics g, Hit h, Font font16)
+        {
+            bool enabled = h.Id >= 0;
+            g.SetColor(new SexyColor(40, 34, 28, 235));
+            g.FillRect(h.X, h.Y + 2, 22, 22);
+            g.SetColor(enabled ? new SexyColor(255, 200, 120, 230) : new SexyColor(150, 130, 105, 200));
+            g.DrawRect(h.X, h.Y + 2, 22, 22);
+            if (h.Selected)
+            {
+                g.SetFont(font16);
+                g.SetColor(new SexyColor(170, 235, 150));
+                g.DrawString("✓", h.X + 3, h.Y + 5);
+            }
+            g.SetFont(font16);
+            g.SetColor(enabled ? new SexyColor(240, 236, 226) : new SexyColor(178, 172, 162));
+            g.DrawString(h.Main, h.X + 32, h.Y + 5);
         }
 
         private static void Bar(Graphics g, Hit h, SexyColor fill, SexyColor edge)
@@ -710,6 +1260,15 @@ namespace PGvZOnlineMod.Ui
                         return;
                     }
                 }
+                if (_dialog != Dialog.None || _dropOpen)
+                {
+                    return; // 模态：对话框/下拉开着时点外面不翻页也不关页，Esc 才收
+                }
+                // 点空白处把焦点还给整页：软键盘弹着的时候没有别的出口
+                if (_app.mWidgetManager.mFocusWidget is IpInputWidget)
+                {
+                    _app.mWidgetManager.SetFocus(this);
+                }
             }
             catch (Exception ex)
             {
@@ -718,27 +1277,26 @@ namespace PGvZOnlineMod.Ui
             base.MouseDown(x, y, theBtnNum, theClickCount);
         }
 
-        // ------------------------------------------------------------ 输入保存
-
-        /// <summary>把 IP/端口写回配置（点建立/加入时落盘）。</summary>
-        private void SaveIdentity()
+        public override void KeyDown(KeyCode theKey)
         {
-            var cfg = Core.ModEnv.GetConfig();
-            cfg.LastIp = _ipEdit.Text;
-            if (int.TryParse(_portEdit.Text.Trim(), out int port) && port >= 1024 && port <= 65535)
+            if (theKey == KeyCode.Escape)
             {
-                cfg.LastPort = port;
+                if (_dropOpen)
+                {
+                    bool backToCreate = _dropFromDialog;
+                    _dropOpen = false;
+                    _dropFromDialog = false;
+                    _dialog = backToCreate ? Dialog.CreateRoom : Dialog.None;
+                    RefreshUi();
+                    return;
+                }
+                if (_dialog != Dialog.None)
+                {
+                    CloseDialog();
+                }
+                return;
             }
-            Core.ModEnv.SaveConfig();
-        }
-
-        private int ParsePort()
-        {
-            if (int.TryParse(_portEdit.Text.Trim(), out int port) && port >= 1024 && port <= 65535)
-            {
-                return port;
-            }
-            return Core.ModEnv.GetConfig().HostPort;
+            base.KeyDown(theKey);
         }
 
         private static string Clip(string s, int max)
@@ -762,13 +1320,27 @@ namespace PGvZOnlineMod.Ui
                     _app.mGameScene = GameScenes.Menu;
                     _app.ShowGameSelector();
                     return;
-                case HostId:
-                    SaveIdentity();
-                    Sync.Session.StartHosting(_app);
+                case AddServerId:
+                    OpenDialog(Dialog.AddServer);
+                    return;
+                case CreateRoomId:
+                    OpenDialog(Dialog.CreateRoom);
+                    return;
+                case RefreshId:
+                    Sync.Session.RediscoverNow();
                     break;
-                case JoinId:
-                    SaveIdentity();
-                    Sync.Session.StartJoining(_app, _ipEdit.Text, ParsePort());
+                case DlgOkId:
+                    ConfirmDialog();
+                    return;
+                case DlgCancelId:
+                    CloseDialog();
+                    return;
+                case PickLevelBtnId:
+                    // 下拉是整页级的覆盖层，对话框先让位；选完关回来时再恢复
+                    _dropFromDialog = true;
+                    JumpToSelectedLevel();
+                    _dropOpen = true;
+                    _dialog = Dialog.None;
                     break;
                 case LevelId:
                     if (!_dropOpen)
@@ -815,11 +1387,22 @@ namespace PGvZOnlineMod.Ui
             if (theId >= LvlRowIdBase && theId < LvlRowIdBase + RowCount)
             {
                 int k = _dropPage * RowCount + (theId - LvlRowIdBase);
-                if (k < _dropIndices.Count)
+                if (k >= _dropIndices.Count)
                 {
-                    Sync.Session.HostSetLevel(_dropIndices[k]);
-                    _dropOpen = false;
+                    return;
                 }
+                int picked = _dropIndices[k];
+                if (_dropFromDialog)
+                {
+                    // 对话框里选关：只记下，等[创建]再落地（还没建房，HostSetLevel 会直接返回）
+                    _pendingLevel = picked;
+                    _dropFromDialog = false;
+                    _dropOpen = false;
+                    _dialog = Dialog.CreateRoom;
+                    return;
+                }
+                Sync.Session.HostSetLevel(picked);
+                _dropOpen = false;
                 return;
             }
             if (theId >= KickBtnIdBase && theId < KickBtnIdBase + Sync.Session.MaxPlayers)
@@ -831,14 +1414,53 @@ namespace PGvZOnlineMod.Ui
                 }
                 return;
             }
-            if (theId >= RoomButtonIdBase && theId < RoomButtonIdBase + RoomButtonCount)
+            if (theId >= RoomRowIdBase && theId < RoomRowIdBase + RoomRowMax)
             {
-                int idx = theId - RoomButtonIdBase;
+                int idx = theId - RoomRowIdBase;
                 if (idx < Sync.Session.RoomList.Count)
                 {
                     Sync.Session.JoinFromDiscovery(Sync.Session.RoomList[idx].Ip);
                 }
+                return;
             }
+            if (theId == ManualRowId)
+            {
+                OpenDialog(Dialog.ManualJoin);
+                return;
+            }
+            if (theId == PwToggleId)
+            {
+                _pwOn = !_pwOn;
+                return;
+            }
+            if (theId >= RemoveServerIdBase && theId < RemoveServerIdBase + ServerRowMax)
+            {
+                RemoveServer(theId - RemoveServerIdBase);
+                return;
+            }
+            if (theId >= ServerRowIdBase && theId < ServerRowIdBase + ServerRowMax)
+            {
+                _sel = theId - ServerRowIdBase;
+            }
+        }
+
+        private void RemoveServer(int rowIndex)
+        {
+            if (rowIndex <= 0 || rowIndex >= _serverRows.Count)
+            {
+                return;
+            }
+            var entry = _serverRows[rowIndex].Entry;
+            if (entry == null)
+            {
+                return;
+            }
+            var cfg = Core.ModEnv.GetConfig();
+            cfg.Servers.Remove(entry);
+            Core.ModEnv.SaveConfig();
+            _sel = 0;
+            Sync.Session.SetStatus("已移除中继：" + entry.Name, false);
+            Core.ModEnv.Log("联机页移除服务器 " + entry.Host + ":" + entry.Port);
         }
 
         public void ButtonPress(int theId)
@@ -877,14 +1499,20 @@ namespace PGvZOnlineMod.Ui
         public override void RemovedFromManager(WidgetManager manager)
         {
             RemoveWidget(_backButton);
-            RemoveWidget(_hostBtn);
-            RemoveWidget(_joinBtn);
+            RemoveWidget(_addServerBtn);
+            RemoveWidget(_createBtn);
+            RemoveWidget(_refreshBtn);
             RemoveWidget(_levelBtn);
             RemoveWidget(_startBtn);
             RemoveWidget(_disconnectBtn);
-            RemoveWidget(_ipEdit);
-            RemoveWidget(_portEdit);
             RemoveWidget(_readyBtn);
+            RemoveWidget(_dlgOk);
+            RemoveWidget(_dlgCancel);
+            RemoveWidget(_pickLevelBtn);
+            RemoveWidget(_nameEdit);
+            RemoveWidget(_addrEdit);
+            RemoveWidget(_portEdit);
+            RemoveWidget(_pwdEdit);
             _hits.Clear();
             base.RemovedFromManager(manager);
         }

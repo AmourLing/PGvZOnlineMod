@@ -423,6 +423,9 @@ namespace PGvZOnlineMod.Sync
             public string HostNick;
             public int LevelIndex;
             public double LastSeen;
+            /// <summary>房内人数；-1 = 对端是旧版本，广播里没带这个字段。</summary>
+            public int Players = -1;
+            public int MaxPlayers = -1;
             public string DisplayText = "";
         }
 
@@ -2780,6 +2783,32 @@ namespace PGvZOnlineMod.Sync
             }
         }
 
+        /// <summary>
+        /// 联机页[刷新]：把 4 秒没再露面的房间先摘掉，并让下一帧立刻重发一次发现请求。
+        /// 搜房本身每秒自动跑，这个按钮是给"对方刚建房、列表还没动"那一刻用的。
+        /// </summary>
+        public static void RediscoverNow()
+        {
+            if (Phase != SessionPhase.Idle)
+            {
+                return;
+            }
+            var expired = new List<string>();
+            foreach (var kv in Rooms)
+            {
+                if (_now - kv.Value.LastSeen > 4.0)
+                {
+                    expired.Add(kv.Key);
+                }
+            }
+            foreach (var key in expired)
+            {
+                Rooms.Remove(key);
+            }
+            RebuildRoomList();
+            _nextDiscoverAt = 0;
+        }
+
         /// <summary>扫段要探测的端口：默认端口 + 27150/27151（覆盖同机双开的自动回退端口）。</summary>
         private static IEnumerable<int> SweepPorts(int basePort)
         {
@@ -2865,7 +2894,7 @@ namespace PGvZOnlineMod.Sync
             {
                 return null;
             }
-            Packets.WriteRoomBeacon(m, Nicks[0], SelectedLevelIndex);
+            Packets.WriteRoomBeacon(m, Nicks[0], SelectedLevelIndex, LivePlayerCount(), MaxPlayers);
             return m;
         }
 
@@ -2878,7 +2907,8 @@ namespace PGvZOnlineMod.Sync
             }
             try
             {
-                Packets.ReadRoomBeacon(im, out string hostNick, out int levelIndex);
+                Packets.ReadRoomBeacon(im, out string hostNick, out int levelIndex,
+                    out int players, out int maxPlayers);
                 if (!Rooms.TryGetValue(ip, out var room))
                 {
                     room = new DiscoveredRoom { Ip = ip };
@@ -2887,6 +2917,11 @@ namespace PGvZOnlineMod.Sync
                 room.Port = im.SenderEndPoint?.Port ?? ModEnv.GetConfig().HostPort;
                 room.HostNick = hostNick;
                 room.LevelIndex = levelIndex;
+                if (players >= 0)
+                {
+                    room.Players = players;
+                    room.MaxPlayers = maxPlayers > 0 ? maxPlayers : MaxPlayers;
+                }
                 room.LastSeen = _now;
                 RebuildRoomList();
             }
@@ -2902,8 +2937,10 @@ namespace PGvZOnlineMod.Sync
             foreach (var room in Rooms.Values)
             {
                 var level = Levels[ClampLevelIndex(room.LevelIndex)];
-                // 带上 IP：自动搜房失败时，玩家照着这行手填就行
-                room.DisplayText = room.HostNick + " 的房间 — " + level.FullLabel + "  [" + room.Ip + "]";
+                // 文案按联机页那一行来（房间：… 关卡：… 人数）；地址由 UI 另起小字画，
+                // 因为自动搜房失败时玩家要照着这行手填
+                string cnt = room.Players < 0 ? "人数未知" : room.Players + "/" + room.MaxPlayers;
+                room.DisplayText = "房间：" + room.HostNick + "的房间   关卡：" + level.FullLabel + "   " + cnt;
                 RoomList.Add(room);
             }
             RoomList.Sort((a, b) => b.LastSeen.CompareTo(a.LastSeen));

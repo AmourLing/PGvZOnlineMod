@@ -432,16 +432,38 @@ namespace PGvZOnlineMod.Protocol
 
         // ---- 局域网房间广播（DiscoveryResponse 的载荷）
 
-        public static void WriteRoomBeacon(NetOutgoingMessage m, string hostNick, int levelIndex)
+        /// <summary>
+        /// 人数是后加的**尾部**字段：老主机的广播里根本没有这两字节。
+        /// 读侧按"还剩多少位"决定读不读，对端没升级时最多是人数显示不出来，
+        /// 不能让整条房间从列表里消失（那等于把兼容性问题升级成"搜不到房"）。
+        /// </summary>
+        public static void WriteRoomBeacon(NetOutgoingMessage m, string hostNick, int levelIndex,
+            int players, int maxPlayers)
         {
             m.Write(hostNick ?? "");
             m.Write(levelIndex);
+            m.Write((byte)(players < 0 ? 0 : players));
+            m.Write((byte)(maxPlayers < 0 ? 0 : maxPlayers));
         }
 
-        public static void ReadRoomBeacon(NetIncomingMessage m, out string hostNick, out int levelIndex)
+        public static void ReadRoomBeacon(NetIncomingMessage m, out string hostNick, out int levelIndex,
+            out int players, out int maxPlayers)
         {
             hostNick = m.ReadString();
             levelIndex = m.ReadInt32();
+            players = -1;
+            maxPlayers = -1;
+            // 这份 Lidgren 的 Position 是"已读**位**数"（实测：读完昵称+关卡后是 88 位 = 11 字节），
+            // 所以按位比、并明确要求还剩一整字节。老主机的包只有前两个字段，读过去会抛，
+            // 房间就从列表里消失了——那是把"对方没升级"放大成"搜不到房"。
+            if (m.LengthBits - m.Position >= 8)
+            {
+                players = m.ReadByte();
+            }
+            if (m.LengthBits - m.Position >= 8)
+            {
+                maxPlayers = m.ReadByte();
+            }
         }
 
         // ---- 输入
