@@ -987,6 +987,17 @@ namespace PGvZOnlineMod.Sync
         private static double _nextListAt;
         private static double _nextSeenAt;
         private static double _nextPingAt;
+        // UDP 没有"连不上"这回事：地址写错、端口没在安全组里放行，表现都是"发了没人回"。
+        // 所以三条请求路径各配一个看门狗，超时就把话说清楚，不能让提示停在那一句"正在…"上。
+        private static double _relayServedAt;
+        private static double _hostReqAt;
+        private static double _joinReqAt;
+        private static double _nextHostAt;
+        private static double _nextJoinAt;
+        private static string _pendingJoinPwd = "";
+        private static bool _relayGotReply;
+        private static bool _relayWarned;
+        private const double RelayTimeout = 6.0;
 
         /// <summary>中继 LIST 回来的房间（联机页右列在"选中继"时显示的就是它）。</summary>
         public static readonly List<RelayRoomInfo> RelayRooms = new List<RelayRoomInfo>();
@@ -1024,6 +1035,9 @@ namespace PGvZOnlineMod.Sync
             }
             _relay.Send(RelayProtocol.BuildPing());
             _relay.Send(RelayProtocol.BuildList());
+            _relayServedAt = _now;
+            _relayGotReply = false;
+            _relayWarned = false;
             _nextListAt = _now + 2.0;
             _nextPingAt = _now + 5.0;
             SetStatus("正在联系中继 " + entry.Name + "…", false);
@@ -1058,6 +1072,8 @@ namespace PGvZOnlineMod.Sync
             _relayHostSide = true;
             _relayPassword = RelayProtocol.Clean(password);
             _relayCode = "";
+            _hostReqAt = _now;
+            _nextHostAt = _now + 2.0;
             _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword));
             _nextSeenAt = _now + 1.0;
             SetStatus("正在向中继登记房间…", false);
@@ -1078,7 +1094,10 @@ namespace PGvZOnlineMod.Sync
                 return;
             }
             _pendingJoinCode = code;
-            _relay.Send(RelayProtocol.BuildJoin(code, password));
+            _pendingJoinPwd = RelayProtocol.Clean(password);
+            _joinReqAt = _now;
+            _nextJoinAt = _now + 2.0;
+            _relay.Send(RelayProtocol.BuildJoin(code, _pendingJoinPwd));
             SetStatus("正在加入房间 " + code + "…", false);
         }
 
@@ -1100,6 +1119,11 @@ namespace PGvZOnlineMod.Sync
             _relayPassword = "";
             _relayHostSide = false;
             _pendingJoinCode = "";
+            _pendingJoinPwd = "";
+            _nextHostAt = 0;
+            _nextJoinAt = 0;
+            _relayGotReply = false;
+            _relayWarned = false;
             if (RelayRooms.Count > 0)
             {
                 RelayRooms.Clear();
@@ -1177,8 +1201,27 @@ namespace PGvZOnlineMod.Sync
                 _relay.Send(RelayProtocol.BuildPing());
             }
 
+            if (_relayHostSide && _relayCode.Length == 0 && _now >= _nextHostAt)
+            {
+                // 第一个 HOST 包丢了就一直等的话，玩家看到的是"点了创建房间没反应"：
+                // 中继再快也是 UDP，每 2 秒原样重发一次（服务端按"同来源+同名+同密码"复用同一个房）。
+                // 注意只推 _nextHostAt，不能动 _hostReqAt——那是超时提示的起点，
+                // 一起推就等于每次重试都把时钟清零，永远报不出"没人回"。
+                _nextHostAt = _now + 2.0;
+                _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword));
+            }
+            if (_pendingJoinCode.Length > 0 && _now >= _nextJoinAt)
+            {
+                _nextJoinAt = _now + 2.0;
+                _relay.Send(RelayProtocol.BuildJoin(_pendingJoinCode, _pendingJoinPwd));
+            }
+
             _relayMsgs.Clear();
             _relay.Poll(_relayMsgs);
+            if (_relayMsgs.Count > 0)
+            {
+                _relayGotReply = true;   // 收到过任何应答，就不再报"没应答"
+            }
             for (int i = 0; i < _relayMsgs.Count; i++)
             {
                 var m = _relayMsgs[i];
@@ -1194,10 +1237,13 @@ namespace PGvZOnlineMod.Sync
                         break;
 
                     case RelayKind.Room:
-                        if (!_relayHostSide || m.Code.Length == 0)
+                        if (m.Code.Length == 0)
                         {
                             break;
                         }
+                        // 超时提示已经报出去之后才回来的应答也要认：中继上那个房是真的建出来了，
+                        // 丢掉它等于服务器上漏一个空房、而玩家永远拿不到房号
+                        _relayHostSide = true;
                         _relayCode = m.Code;
                         OpenTunnels(m.HostPort);
                         SetStatus("房间号 " + _relayCode + " —— 告诉朋友，他填这个号就能进", false);
@@ -1221,6 +1267,38 @@ namespace PGvZOnlineMod.Sync
                         break;
                 }
             }
+            RelayWatchdog();
+        }
+
+        /// <summary>
+        /// 三条请求路径的超时提示。UDP 没有"连不上"这回事——地址写错、端口没在安全组里放行，
+        /// 表现全是"发了没人回"，不自己判超时的话提示会永远停在"正在…"那一句上。
+        /// </summary>
+        private static void RelayWatchdog()
+        {
+            if (_relay == null)
+            {
+                return;
+            }
+            if (!_relayGotReply && !_relayWarned && _now - _relayServedAt > RelayTimeout)
+            {
+                _relayWarned = true;
+                SetStatus("中继 " + (_relayServed?.Host ?? "") + ":" + (_relayServed?.Port ?? 0)
+                    + " 没应答：核对地址与端口，并确认安全组放行了这段 UDP", true);
+                ModEnv.Log("中继无应答（PING/LIST 都没回）");
+            }
+            if (_relayHostSide && _relayCode.Length == 0 && _now - _hostReqAt > RelayTimeout)
+            {
+                _relayHostSide = false;
+                SetStatus("中继没回建房应答；局域网房还在（同网段仍能搜到），再点一次[创建房间]重试", true);
+                ModEnv.Log("中继建房超时无应答");
+            }
+            if (_pendingJoinCode.Length > 0 && _now - _joinReqAt > RelayTimeout)
+            {
+                SetStatus("中继没回话，没加入房间 " + _pendingJoinCode, true);
+                _pendingJoinCode = "";
+                ModEnv.Log("中继 JOIN 超时无应答");
+            }
         }
 
         private static void OnRelayError(string reason)
@@ -1235,11 +1313,15 @@ namespace PGvZOnlineMod.Sync
             };
             ModEnv.Log("中继错误 " + reason);
             _pendingJoinCode = "";
-            if (_relayHostSide && reason == "full")
+            if (_relayHostSide && _relayCode.Length == 0)
             {
+                // 建房这一步已经拿到应答（哪怕是拒绝）：不能再让超时看门狗报"没应答"，那是假话
                 _relayHostSide = false;
-                Net.Shutdown();
-                Phase = SessionPhase.Idle;
+                if (reason == "full")
+                {
+                    Net.Shutdown();
+                    Phase = SessionPhase.Idle;
+                }
             }
             SetStatus(why, true);
         }

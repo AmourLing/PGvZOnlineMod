@@ -54,6 +54,8 @@ namespace PGvZOnlineVerify
             TestIdentity();
             TestRelayEndToEnd();
             TestRelaySession();
+            TestRelayLateReply();
+            TestRelayHostRetry();
             TestDetour();
             Console.WriteLine($"== 结果：通过 {_passes} / 失败 {_failures} ==");
             return _failures == 0 ? 0 : 1;
@@ -1536,6 +1538,10 @@ namespace PGvZOnlineVerify
             {
                 var entry = new ServerEntry { Name = "离线门中继", Host = "127.0.0.1", Port = control };
 
+                // 先泵几下：Session 的 `_now` 只在 Pump 里推进，不推的话看门狗会拿
+                // "请求时刻=0、现在=进程已跑的秒数"直接判超时（游戏里每帧都泵，不会这样）
+                PumpUntil(() => false, 200);
+
                 PGvZOnlineMod.Sync.Session.StartHostingViaRelay(null, entry, "pw");
                 PumpUntil(() => PGvZOnlineMod.Sync.Session.RelayRoomCode.Length == 6, 6000);
                 Check("Session 经中继建房拿到 6 位房间号",
@@ -1668,6 +1674,34 @@ namespace PGvZOnlineVerify
                 Check("OK 应答到达后会话才去连（进入 JoiningLobby）",
                     PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.JoiningLobby,
                     "phase=" + PGvZOnlineMod.Sync.Session.Phase);
+
+                // ---- 看门狗：UDP 不会"连不上"，只会没人回；三条路径都得说清 ---
+                // 指向一个没人听的本地端口（等价于"地址写错/安全组没放行"），
+                // 顺带证明关掉了 ICMP 复位之后这里不会抛、只是安静地没回。
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                var dead = new ServerEntry { Name = "死中继", Host = "127.0.0.1", Port = FreeUdpPort() };
+
+                PGvZOnlineMod.Sync.Session.RelaySelect(dead);
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.StatusText.Contains("没应答"), 12000);
+                Check("中继无应答时讲清了「是没人回」而不是「连不上」",
+                    PGvZOnlineMod.Sync.Session.StatusText.Contains("没应答")
+                    && PGvZOnlineMod.Sync.Session.StatusText.Contains("安全组"),
+                    "status=" + PGvZOnlineMod.Sync.Session.StatusText);
+
+                PGvZOnlineMod.Sync.Session.JoinViaRelay(dead, "123456", "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.StatusText.Contains("没加入房间 123456"), 12000);
+                Check("填了房号但中继没回话：不会永远停在「正在加入…」",
+                    PGvZOnlineMod.Sync.Session.StatusText.Contains("没加入房间 123456")
+                    && PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.Idle,
+                    "status=" + PGvZOnlineMod.Sync.Session.StatusText);
+
+                PGvZOnlineMod.Sync.Session.StartHostingViaRelay(null, dead, "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.StatusText.Contains("中继没回建房应答"), 12000);
+                Check("建房没应答：局域网房还在、并提示可以重试",
+                    PGvZOnlineMod.Sync.Session.StatusText.Contains("中继没回建房应答")
+                    && PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.HostingLobby,
+                    "status=" + PGvZOnlineMod.Sync.Session.StatusText
+                    + " phase=" + PGvZOnlineMod.Sync.Session.Phase);
             }
             catch (Exception ex)
             {
@@ -1715,6 +1749,33 @@ namespace PGvZOnlineVerify
                 {
                 }
             }) { IsBackground = true }.Start();
+            // 等它真能应答再返回：dotnet 冷启动可能好几秒，不等的话第一条请求打进空气里，
+            // 而中继那边根本没收到过这个来源的建房请求（用例就是这么偶发变红的）
+            using var probe = new PGvZOnlineMod.Net.RelayClient();
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed.TotalSeconds < 25 && !p.HasExited)
+            {
+                if (!probe.Open("127.0.0.1", control))
+                {
+                    Thread.Sleep(200);
+                    continue;
+                }
+                probe.Send(RelayProtocol.BuildPing());
+                var got = new List<RelayMessage>();
+                var one = Stopwatch.StartNew();
+                while (one.Elapsed.TotalMilliseconds < 500)
+                {
+                    probe.Poll(got);
+                    foreach (var m in got)
+                    {
+                        if (m.Kind == RelayKind.Pong)
+                        {
+                            return p;
+                        }
+                    }
+                    Thread.Sleep(5);
+                }
+            }
             return p;
         }
 
@@ -1726,6 +1787,147 @@ namespace PGvZOnlineVerify
             {
                 PGvZOnlineMod.Sync.Session.Pump(null);
                 Thread.Sleep(5);
+            }
+        }
+
+        // ------------------------------------------------------------ 8. 中继慢应答
+
+        /// <summary>
+        /// 中继 7 秒后才回 ROOM（比看门狗的 6 秒晚）。钉的是"晚到的应答也要认"：
+        /// 丢掉的话服务器上漏着一个真房，而玩家永远拿不到房号，
+        /// 表现就是"点了创建房间、等半天啥也没有"——公网冷启动时真会遇到。
+        /// </summary>
+        private static void TestRelayLateReply()
+        {
+            Console.WriteLine("-- 中继慢应答 --");
+            int port = FreeUdpPort();
+            using var slow = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            slow.Bind(new IPEndPoint(IPAddress.Any, port));
+            bool stop = false;
+            new Thread(() =>
+            {
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                var buf = new byte[256];
+                while (!stop)
+                {
+                    int n;
+                    try
+                    {
+                        n = slow.ReceiveFrom(buf, ref from);
+                    }
+                    catch { return; }
+                    if (RelayProtocol.Parse(System.Text.Encoding.UTF8.GetString(buf, 0, n)).Kind != RelayKind.Host)
+                    {
+                        continue;
+                    }
+                    Thread.Sleep(7000);   // 故意比 RelayTimeout 晚
+                    try
+                    {
+                        slow.SendTo(System.Text.Encoding.UTF8.GetBytes("ROOM|424242|27201|27200"), from);
+                    }
+                    catch { return; }
+                }
+            }) { IsBackground = true }.Start();
+
+            try
+            {
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                PumpUntil(() => false, 200);
+                var entry = new ServerEntry { Name = "慢中继", Host = "127.0.0.1", Port = port };
+                PGvZOnlineMod.Sync.Session.StartHostingViaRelay(null, entry, "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.StatusText.Contains("中继没回建房应答"), 9000);
+                Check("慢应答期间先报了超时，不是一直干等",
+                    PGvZOnlineMod.Sync.Session.StatusText.Contains("中继没回建房应答"));
+
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.RelayRoomCode == "424242", 9000);
+                Check("晚到的 ROOM 仍然认账（不漏房、玩家拿得到房号）",
+                    PGvZOnlineMod.Sync.Session.RelayRoomCode == "424242"
+                    && PGvZOnlineMod.Sync.Session.RelayHosting
+                    && PGvZOnlineMod.Sync.Session.RelayTunnelCount == 3,
+                    "code=" + PGvZOnlineMod.Sync.Session.RelayRoomCode
+                    + " hosting=" + PGvZOnlineMod.Sync.Session.RelayHosting);
+            }
+            finally
+            {
+                stop = true;
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                PumpUntil(() => false, 300);
+            }
+        }
+
+        /// <summary>
+        /// 前两次请求故意不答、第三次才答：钉的是 HOST 与 JOIN 都会自己重试。
+        /// 不重试的话玩家点了[创建房间]或[加入]就再也没下文——UDP 丢一个包是常态，不是异常。
+        /// </summary>
+        private static void TestRelayHostRetry()
+        {
+            Console.WriteLine("-- 中继请求重试 --");
+            int port = FreeUdpPort();
+            using var stub = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            stub.Bind(new IPEndPoint(IPAddress.Any, port));
+            bool stop = false;
+            int hosts = 0, joins = 0;
+            new Thread(() =>
+            {
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                var buf = new byte[256];
+                while (!stop)
+                {
+                    int n;
+                    try
+                    {
+                        n = stub.ReceiveFrom(buf, ref from);
+                    }
+                    catch { return; }
+                    var kind = RelayProtocol.Parse(System.Text.Encoding.UTF8.GetString(buf, 0, n)).Kind;
+                    string reply = null;
+                    if (kind == RelayKind.Host && ++hosts >= 3)
+                    {
+                        reply = "ROOM|135790|27203|27202";
+                    }
+                    else if (kind == RelayKind.Join && ++joins >= 3)
+                    {
+                        reply = "OK|27203";
+                    }
+                    if (reply == null)
+                    {
+                        continue;   // 前两次装死
+                    }
+                    try
+                    {
+                        stub.SendTo(System.Text.Encoding.UTF8.GetBytes(reply), from);
+                    }
+                    catch { return; }
+                }
+            }) { IsBackground = true }.Start();
+
+            try
+            {
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                PumpUntil(() => false, 200);
+                var entry = new ServerEntry { Name = "装死中继", Host = "127.0.0.1", Port = port };
+
+                PGvZOnlineMod.Sync.Session.StartHostingViaRelay(null, entry, "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.RelayRoomCode == "135790", 5000);
+                Check("前两次 HOST 没答也能拿到房号（建房会重试）",
+                    PGvZOnlineMod.Sync.Session.RelayRoomCode == "135790" && hosts >= 3,
+                    "code=" + PGvZOnlineMod.Sync.Session.RelayRoomCode + " 收到 HOST " + hosts + " 次");
+
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                PumpUntil(() => false, 200);
+                PGvZOnlineMod.Sync.Session.JoinViaRelay(entry, "135790", "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.Phase
+                    == PGvZOnlineMod.Sync.SessionPhase.JoiningLobby, 5000);
+                Check("前两次 JOIN 没答也能进到连接阶段（加入会重试）",
+                    PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.JoiningLobby
+                    && joins >= 3,
+                    "phase=" + PGvZOnlineMod.Sync.Session.Phase + " 收到 JOIN " + joins + " 次");
+            }
+            finally
+            {
+                stop = true;
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                PumpUntil(() => false, 200);
             }
         }
 
