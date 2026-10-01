@@ -545,8 +545,6 @@ namespace PGvZOnlineMod.Hooks
 
         // ------------------------------------------------------------ 加速倍率（MouseUpInternal 变化检测）
 
-        private static int _lastAccelNum = -1;
-
         private static void BoardMouseUpInternalHook(
             Action<Board, int, int, int, bool> orig, Board self, int x, int y, int theClickCount, bool isTouch)
         {
@@ -557,7 +555,9 @@ namespace PGvZOnlineMod.Hooks
                 {
                     return;
                 }
-                Session.DetectAccelerationChange(self, ref _lastAccelNum);
+                // 基线放在 Session 里：收到对方下发的倍率时也要更新它，
+                // 放在这里会让"客人收到主机广播"被当成客人自己点了加速，再回一条给主机
+                Session.DetectAccelerationChange(self);
             }
             catch
             {
@@ -746,6 +746,9 @@ namespace PGvZOnlineMod.Hooks
                     try
                     {
                         self.mApp?.PlayFoley(FoleyType.UseShovel); // 本地音效反馈
+                        // 原生铲完就在这个分支里 ClearCursor()（铲子回架）。我们没走 orig，
+                        // 少这一步会让客人铲完手里还攥着铲子，得再点一下才放回去。
+                        self.ClearCursor();
                     }
                     catch
                     {

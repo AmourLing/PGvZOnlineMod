@@ -1748,26 +1748,33 @@ namespace PGvZOnlineMod.Sync
 
         // ============================================================ 加速倍率同步
 
-        /// <summary>MouseUpInternal 后调用：分子变化 = 本方点了加速/减速 → 广播新数值。</summary>
-        public static void DetectAccelerationChange(Board board, ref int lastKnown)
+        /// <summary>MouseUpInternal 后调用：分子变化 = 本方点了加速/减速 → 报给对方。</summary>
+        private static int _lastAccelNum = -1;
+
+        public static void DetectAccelerationChange(Board board)
         {
             if (!SyncActive || board == null)
             {
                 return;
             }
-            if (lastKnown == -1)
+            if (_lastAccelNum == -1)
             {
-                lastKnown = board.mAccelerationNumerator; // 进局首帧只记录基线
+                _lastAccelNum = board.mAccelerationNumerator; // 进局首帧只记录基线
                 return;
             }
-            if (board.mAccelerationNumerator != lastKnown)
+            if (board.mAccelerationNumerator != _lastAccelNum)
             {
-                lastKnown = board.mAccelerationNumerator;
+                _lastAccelNum = board.mAccelerationNumerator;
                 OnAccelerationChanged(board);
             }
         }
 
-        /// <summary>任一侧加速倍率变化 → 广播（数值直接落对方字段，双方一致）。</summary>
+        /// <summary>
+        /// 本方加速倍率变化 → 报出去。
+        /// 以前这里只 `SendReliableToClients`，客手上没有"客户端"可发，
+        /// 所以客人点加速主机完全不知道（实机反馈的第一条）；现在客人走上行请求，
+        /// 主机收到后落地再转给全员。包型与字段没变，只是多了一个方向。
+        /// </summary>
         public static void OnAccelerationChanged(Board board)
         {
             if (!SyncActive || board == null)
@@ -1777,10 +1784,20 @@ namespace PGvZOnlineMod.Sync
             try
             {
                 var m = Net.CreateMessage();
-                if (m != null)
+                if (m == null)
                 {
-                    Packets.WriteAcceleration(m, board.mAccelerationNumerator, board.mAccelerationDenominator);
+                    return;
+                }
+                Packets.WriteAcceleration(m, board.mAccelerationNumerator, board.mAccelerationDenominator);
+                if (IsHost)
+                {
                     Net.SendReliableToClients(m);
+                }
+                else
+                {
+                    Net.SendReliableToHost(m);
+                    ModEnv.Log("[加速] 客人上报 " + board.mAccelerationNumerator + "/"
+                        + board.mAccelerationDenominator);
                 }
             }
             catch (Exception ex)
@@ -1801,6 +1818,13 @@ namespace PGvZOnlineMod.Sync
                 board.mAccelerationNumerator = numerator;
                 board.mAccelerationDenominator = denominator;
                 board.mAccelerationFrameIndex = 0;
+                // 对方下发的值要写进基线，否则下一帧变化检测会以为"本方点了加速"再回一条
+                _lastAccelNum = numerator;
+                if (IsHost)
+                {
+                    // 客人报上来的请求由主机落地并转给全员（含其他客人）
+                    OnAccelerationChanged(board);
+                }
                 ModEnv.Log("[加速] 同步为 " + numerator + "/" + denominator);
             }
             catch (Exception ex)

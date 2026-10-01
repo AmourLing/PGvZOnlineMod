@@ -43,18 +43,18 @@ namespace PGvZOnlineMod.Ui
 
         private const int KickBtnIdBase = 125;      // 125..127（最多 3 个客人位）
         private const int LvlPageIdBase = 150;      // 150..155 下拉的分类行
-        private const int LvlRowIdBase = 160;       // 160..163 下拉的关卡条目行
+        private const int LvlRowIdBase = 160;       // 160..164 下拉的关卡条目行（每页 PickRows 关）
         private const int LvlPrevId = 170;
         private const int LvlNextId = 171;
         private const int RoomRowIdBase = 180;      // 180..187 房间列表行
         private const int ServerRowIdBase = 190;    // 190..199 服务器行
         private const int ManualRowId = 240;
         private const int PwToggleId = 241;
+        private const int DropCloseId = 244;      // 选关面板的[完成]
         private const int DelServerId = 243;
         private const int CodeRowId = 242;
         private const int RelayRoomIdBase = 250;  // 250..257 中继列表里的房间行
         internal const int TabCount = 6;            // 全部 + 五个页签（离线回归会拿它当分类数的上限校验）
-        private const int RowCount = 4;             // 下拉每页显示几关
 
         private const int RoomRowMax = 8;           // 一屏放得下的房间行数
         private const int ServerRowMax = 10;        // 局域网 + 8 台中继 + 手动一行
@@ -155,7 +155,6 @@ namespace PGvZOnlineMod.Ui
             public const int RoomPitch = 44;
             public const int RoomRowH = 38;
             public const int MaxRoomRows = 7;         // 右列一屏最多几行（含"用房间号加入"）
-            public const int DropH = 178;
             public const int HeaderY = 42;
             public const int PanelTitleY = PanelTopConst + 8;
             private const int PanelTopConst = 64;
@@ -190,9 +189,6 @@ namespace PGvZOnlineMod.Ui
             public int AddButton => PanelBottom - BtnH - 6;
             public int DelButton => AddButton - BtnH - 4;
             public int Notice => ButtonRow - 66;
-            public int DropX => X0 + 8;
-            public int DropY => PanelTop + 26;
-            public int DropW => Cw - 16;
 
             /// <summary>能塞下几行服务器：窗口矮就少画几行，而不是叠到按钮上。</summary>
             public int ServerRowsFit => Fit(DelButton - 4, ServerPitch, ServerRowH, MaxServerRows, 3);
@@ -220,6 +216,25 @@ namespace PGvZOnlineMod.Ui
             public int RelayRowsBottom => ListTop + (RoomRowsFit - 1) * RoomPitch + RoomRowH;
             public int NoticeBottom => Notice + 36 + 12;
             public int NickY => H - 26;
+
+            // ---- 选关面板：整块内容区都给它（挤成一坨、翻页文字叠在一起都是以前的事）
+            public const int PickRows = 5;
+            public const int PickRowH = 30;
+            public const int PickRowPitch = 34;
+            public const int PickTabH = 26;
+            public const int PickCtlH = 26;
+
+            public int PickX => X0;
+            public int PickY => PanelTop;
+            public int PickW => Cw;
+            public int PickH => PanelBottom - PanelTop;
+            public int PickTabsY => PickY + 12;
+            public int PickRowsY => PickY + 48;
+            public int PickRowsBottom => PickRowsY + (PickRows - 1) * PickRowPitch + PickRowH;
+            public int PickCtlY => PanelBottom - PickCtlH - 10;
+
+            /// <summary>分类页签均分宽度（页签个数由界面传进来）。</summary>
+            public int PickTabWidth(int tabs) => (PickW - 16 - (tabs - 1) * 6) / Math.Max(1, tabs);
         }
 
         public static bool ScreenOpen => _inst != null;
@@ -431,10 +446,6 @@ namespace PGvZOnlineMod.Ui
         private int RelayRowsBottom => _geom.RelayRowsBottom;
 
         // 选关下拉是整页级的覆盖层，几何跟着布局走（写死 158 起会在宽屏上压到左列）
-        private int DropX => _geom.DropX;
-        private int DropY => _geom.DropY;
-        private int DropW => _geom.DropW;
-        private int DropH => LobbyGeom.DropH;
 
         /// <summary>把真按钮摆到布局上；分辨率变了（宽屏切换）要重算一遍。</summary>
         private void ApplyLayout()
@@ -571,13 +582,15 @@ namespace PGvZOnlineMod.Ui
             }
 
             _backButton.mVisible = true;
-            _addServerBtn.mVisible = !room;
-            _createBtn.mVisible = !room && !SelectedIsManual;
-            _refreshBtn.mVisible = !room;
-            // 删除只对"玩家自己加的中继"有意义，且只在选中它时出现（不再画 × 在行上误触）
-            _delServerBtn.mVisible = !room && SelectedIsRelay;
+            // 选关面板是整页覆盖层：开着的时候底下这些按钮不该露出来（实机反馈第 4 条）
+            bool pick = _dropOpen;
+            _backButton.mVisible = !pick;
+            _addServerBtn.mVisible = !room && !pick;
+            _createBtn.mVisible = !room && !SelectedIsManual && !pick;
+            _refreshBtn.mVisible = !room && !pick;
+            _delServerBtn.mVisible = !room && SelectedIsRelay && !pick;
             // 离开房间只在房间内出现：这里漏设过一次，浏览页中间就杵着一个"离开房间"
-            _disconnectBtn.mVisible = room;
+            _disconnectBtn.mVisible = room && !pick;
 
             bool canPick = room && host && connected;
             if (!canPick && !_dropFromDialog)
@@ -586,9 +599,9 @@ namespace PGvZOnlineMod.Ui
                 // 但"创建房间"对话框里点开的下拉不属于这条：那时还没建房（room=false），
                 // 一并关掉会让对话框直接消失，表现就是"点[选择关卡]没反应"
             }
-            _levelBtn.mVisible = canPick;
-            _startBtn.mVisible = room && host;
-            _readyBtn.mVisible = room && !host;
+            _levelBtn.mVisible = canPick && !pick;
+            _startBtn.mVisible = room && host && !pick;
+            _readyBtn.mVisible = room && !host && !pick;
             if (_readyBtn.mVisible)
             {
                 _readyBtn.mLabel = Sync.Session.AmRoomReady ? "取消准备" : "准备";
@@ -848,13 +861,13 @@ namespace PGvZOnlineMod.Ui
                 if (pos >= 0)
                 {
                     _dropFilter = f;
-                    _dropPage = pos / RowCount;
+                    _dropPage = pos / LobbyGeom.PickRows;
                     return;
                 }
             }
             _dropFilter = 0;
             int inAll = Sync.Session.LevelIndicesOfPage(_dropFilters[0]).IndexOf(sel);
-            _dropPage = inAll >= 0 ? inAll / RowCount : 0;
+            _dropPage = inAll >= 0 ? inAll / LobbyGeom.PickRows : 0;
         }
 
         private int PendingOrCurrent()
@@ -869,30 +882,32 @@ namespace PGvZOnlineMod.Ui
                 _dropFilter = 0;
             }
             _dropIndices = Sync.Session.LevelIndicesOfPage(_dropFilters[_dropFilter]);
-            _dropPages = Math.Max(1, (_dropIndices.Count + RowCount - 1) / RowCount);
+            _dropPages = Math.Max(1, (_dropIndices.Count + LobbyGeom.PickRows - 1) / LobbyGeom.PickRows);
             if (_dropPage >= _dropPages)
             {
                 _dropPage = 0;
             }
             int selected = Sync.Session.ClampLevelIndex(PendingOrCurrent());
 
-            for (int i = 0; i < _dropFilters.Count && i < TabCount; i++)
+            int tabs = Math.Min(_dropFilters.Count, TabCount);
+            int tabW = Math.Max(40, _geom.PickTabWidth(tabs));
+            for (int i = 0; i < tabs; i++)
             {
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.Tab,
-                    X = DropX + 8 + i * 78,
-                    Y = DropY + 6,
-                    W = 74,
-                    H = 22,
+                    X = _geom.PickX + 8 + i * (tabW + 6),
+                    Y = _geom.PickTabsY,
+                    W = tabW,
+                    H = LobbyGeom.PickTabH,
                     Id = LvlPageIdBase + i,
                     Main = _dropFilters[i],
                     Selected = i == _dropFilter,
                 });
             }
-            for (int i = 0; i < RowCount; i++)
+            for (int i = 0; i < LobbyGeom.PickRows; i++)
             {
-                int k = _dropPage * RowCount + i;
+                int k = _dropPage * LobbyGeom.PickRows + i;
                 if (k >= _dropIndices.Count)
                 {
                     break;
@@ -901,28 +916,40 @@ namespace PGvZOnlineMod.Ui
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.LevelRow,
-                    X = DropX + 8,
-                    Y = DropY + 34 + i * 28,
-                    W = DropW - 16,
-                    H = 26,
+                    X = _geom.PickX + 8,
+                    Y = _geom.PickRowsY + i * LobbyGeom.PickRowPitch,
+                    W = _geom.PickW - 16,
+                    H = LobbyGeom.PickRowH,
                     Id = LvlRowIdBase + i,
                     Main = Clip(Sync.Session.Levels[li].Name, 26),
                     Selected = li == selected,
                 });
             }
+            int ctlY = _geom.PickCtlY;
             if (_dropPages > 1)
             {
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Pager, X = DropX + 8, Y = DropY + 150, W = 86, H = 22,
+                    Kind = HitKind.Pager, X = _geom.PickX + 8, Y = ctlY, W = 92, H = LobbyGeom.PickCtlH,
                     Id = LvlPrevId, Main = "< 上一页",
                 });
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Pager, X = DropX + 100, Y = DropY + 150, W = 86, H = 22,
+                    Kind = HitKind.Pager, X = _geom.PickX + 106, Y = ctlY, W = 92, H = LobbyGeom.PickCtlH,
                     Id = LvlNextId, Main = "下一页 >",
                 });
             }
+            // 没有退出按钮的话，点开就只能"必须选一个"或者退回主菜单（实机反馈的第 3 条）
+            _hits.Add(new Hit
+            {
+                Kind = HitKind.Pager,
+                X = _geom.PickX + _geom.PickW - 100,
+                Y = ctlY,
+                W = 92,
+                H = LobbyGeom.PickCtlH,
+                Id = DropCloseId,
+                Main = "完成",
+            });
         }
 
         // ------------------------------------------------------------ 对话框开关
@@ -1186,14 +1213,13 @@ namespace PGvZOnlineMod.Ui
         private void DrawDropdown(Graphics g)
         {
             // 下拉面板底：盖住它下面的内容（经典下拉行为），条目随后由 DrawHits 画在上面
-            g.SetColor(new SexyColor(24, 28, 20, 246));
-            g.FillRect(DropX, DropY, DropW, DropH);
+            g.SetColor(new SexyColor(24, 28, 20, 250));
+            g.FillRect(_geom.PickX, _geom.PickY, _geom.PickW, _geom.PickH);
             g.SetColor(new SexyColor(170, 220, 150, 220));
-            g.DrawRect(DropX, DropY, DropW, DropH);
-            Text(g, "第 " + (_dropPage + 1) + "/" + _dropPages + " 页 · 共 " + _dropIndices.Count + " 关",
-                DropX + 8, DropY + 156, Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
-            Text(g, "点一条即选定", DropX + DropW - 8, DropY + 156, Resources.FONT_BRIANNETOD12,
-                new SexyColor(150, 160, 150), DrawStringJustification.Right);
+            g.DrawRect(_geom.PickX, _geom.PickY, _geom.PickW, _geom.PickH);
+            Text(g, "选关 · 第 " + (_dropPage + 1) + "/" + _dropPages + " 页 · 共 "
+                + _dropIndices.Count + " 关", _geom.PickX + 210, _geom.PickCtlY + 7,
+                Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
         }
 
         private void DrawBrowse(Graphics g)
@@ -1495,11 +1521,7 @@ namespace PGvZOnlineMod.Ui
             {
                 if (_dropOpen)
                 {
-                    bool backToCreate = _dropFromDialog;
-                    _dropOpen = false;
-                    _dropFromDialog = false;
-                    _dialog = backToCreate ? Dialog.CreateRoom : Dialog.None;
-                    RefreshUi();
+                    ClosePicker();
                     return;
                 }
                 if (_dialog != Dialog.None)
@@ -1569,6 +1591,9 @@ namespace PGvZOnlineMod.Ui
                     }
                     _dropOpen = !_dropOpen;
                     break;
+                case DropCloseId:
+                    ClosePicker();
+                    return;
                 case StartId:
                     Sync.Session.HostStartGame(_app);
                     break;
@@ -1592,6 +1617,19 @@ namespace PGvZOnlineMod.Ui
             RefreshUi();
         }
 
+        /// <summary>收掉选关面板：从"创建房间"对话框点开的，收完要回到那个对话框。</summary>
+        private void ClosePicker()
+        {
+            bool backToCreate = _dropFromDialog;
+            _dropOpen = false;
+            _dropFromDialog = false;
+            if (backToCreate)
+            {
+                _dialog = Dialog.CreateRoom;
+            }
+            RefreshUi();
+        }
+
         private void HandleOtherButton(int theId)
         {
             if (theId >= LvlPageIdBase && theId < LvlPageIdBase + TabCount)
@@ -1604,9 +1642,9 @@ namespace PGvZOnlineMod.Ui
                 }
                 return;
             }
-            if (theId >= LvlRowIdBase && theId < LvlRowIdBase + RowCount)
+            if (theId >= LvlRowIdBase && theId < LvlRowIdBase + LobbyGeom.PickRows)
             {
-                int k = _dropPage * RowCount + (theId - LvlRowIdBase);
+                int k = _dropPage * LobbyGeom.PickRows + (theId - LvlRowIdBase);
                 if (k >= _dropIndices.Count)
                 {
                     return;

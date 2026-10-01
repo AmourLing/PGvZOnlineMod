@@ -1252,11 +1252,25 @@ namespace PGvZOnlineVerify
                     at + " 返回底=" + (g.PanelBottom + 10 + bh));
                 Want(g.RightX + g.RightW <= g.X0 + g.Cw + 1 && g.RightW >= 160, "右列超出内容区",
                     at + " 右列=" + g.RightX + "+" + g.RightW);
-                Want(g.DropX >= 0 && g.DropX + g.DropW <= w && g.DropY + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.DropH <= h,
-                    "选关下拉超出画面", at + " 下拉=" + g.DropX + "," + g.DropY + " 宽=" + g.DropW);
+                // 选关面板（整块内容区）：页签 / 关卡行 / 翻页+完成 三排互不相交，也不越出面板
+                Want(g.PickX >= 0 && g.PickX + g.PickW <= w && g.PickY + g.PickH <= h,
+                    "选关面板超出画面", at + " 面板=" + g.PickX + "," + g.PickY
+                    + " " + g.PickW + "x" + g.PickH);
+                Want(g.PickTabsY + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.PickTabH + 4
+                     <= g.PickRowsY, "选关页签压到关卡行", at);
+                Want(g.PickRowsBottom + 6 <= g.PickCtlY, "选关关卡行压到翻页/完成那一排",
+                    at + " 行底=" + g.PickRowsBottom + " 控制排=" + g.PickCtlY);
+                Want(g.PickCtlY + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.PickCtlH + 2
+                     <= g.PanelBottom, "选关翻页/完成那一排掉出面板外", at);
+                Want(g.PickTabWidth(6) >= 40 && g.PickTabWidth(1) >= 40, "选关页签窄到放不下字",
+                    at + " 六页签宽=" + g.PickTabWidth(6));
+                // 页签是均分宽度的：算错就会横向溢出面板（这条是变异"页签×3 宽"逼出来的）
+                int tabW6 = g.PickTabWidth(6);
+                Want(8 + 6 * (tabW6 + 6) - 6 <= g.PickW - 8, "选关页签排不下 6 个（横向超出面板）",
+                    at + " 页签宽=" + tabW6 + " 面板宽=" + g.PickW);
             }
 
-            Check("浏览页布局：各分辨率下互不重叠（" + sizes.Length + " 档 × 12 条）",
+            Check("浏览页与选关面板：各分辨率下矩形互不重叠（" + sizes.Length + " 档）",
                 bad.Count == 0, bad.Count == 0 ? "" : string.Join(" ; ", bad.Take(6)));
         }
 
