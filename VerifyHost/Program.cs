@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using Lawn;
 using Lidgren.Network;
@@ -55,6 +56,7 @@ namespace PGvZOnlineVerify
             TestDefaultRelaySeed();
             TestLobbyGeometry();
             TestRelayEndToEnd();
+            TestRelayGates();
             TestRelaySession();
             TestRelayLateReply();
             TestRelayHostRetry();
@@ -847,11 +849,21 @@ namespace PGvZOnlineVerify
         {
             Console.WriteLine("-- 中继控制协议 --");
 
-            var host = RelayProtocol.Parse(RelayProtocol.BuildHost("测试主机☆", "p|w|d"));
+            var host = RelayProtocol.Parse(RelayProtocol.BuildHost("测试主机☆", "p|w|d", 18));
             Check("HOST 往返（房间名含中文）",
                 host.Kind == RelayKind.Host && host.Name == "测试主机☆", "kind=" + host.Kind + " name=" + host.Name);
             Check("密码里的分隔符被 Clean 吃掉，不会多出一个字段",
                 host.Password == "pwd", "pwd=" + host.Password);
+            // 版本字段只许追加在尾部：放前面的话旧服务端按第 1、2 字段去解，
+            // 会静默建出一个名叫 "2" 的房间并照常放行，比直接拒绝坏得多
+            Check("HOST 尾部的两个版本号各自归位，没串进房名与密码",
+                host.Ctl == RelayProtocol.Version && host.GameVersion == 18
+                && host.Name == "测试主机☆" && host.Password == "pwd",
+                "ctl=" + host.Ctl + " game=" + host.GameVersion);
+            Check("不带版本的旧报文解出 0（服务端据此拒绝，不会当 v2 猜）",
+                RelayProtocol.Parse("HOST|小明|pw") is var noVer
+                && noVer.Kind == RelayKind.Host && noVer.Ctl == 0 && noVer.GameVersion == 0
+                && noVer.Name == "小明", "ctl=" + noVer.Ctl);
 
             var seen = RelayProtocol.Parse(RelayProtocol.BuildSeen("123456", 7, 2, 4, "ab"));
             Check("SEEN 往返（关卡/人数/上限/密码）",
@@ -868,17 +880,33 @@ namespace PGvZOnlineVerify
                 room.Kind == RelayKind.Room && room.Code == "654905" && room.GuestPort == 27201 && room.HostPort == 27200,
                 "g=" + room.GuestPort + " h=" + room.HostPort);
 
-            var join = RelayProtocol.Parse(RelayProtocol.BuildJoin("000000", ""));
-            Check("JOIN 空密码", join.Kind == RelayKind.Join && join.Code == "000000" && join.Password == "");
+            var join = RelayProtocol.Parse(RelayProtocol.BuildJoin("000000", "", 18));
+            Check("JOIN 空密码仍带上两个版本号",
+                join.Kind == RelayKind.Join && join.Code == "000000" && join.Password == ""
+                && join.Ctl == RelayProtocol.Version && join.GameVersion == 18,
+                "game=" + join.GameVersion);
             Check("OK 往返客人口",
                 RelayProtocol.Parse(RelayProtocol.BuildOk(27201)) is var okp
                 && okp.Kind == RelayKind.Ok && okp.GuestPort == 27201);
             Check("LIST/DROP/PING/PONG/ERR 往返",
-                RelayProtocol.Parse(RelayProtocol.BuildList()).Kind == RelayKind.List
+                RelayProtocol.Parse(RelayProtocol.BuildList("T32")).Kind == RelayKind.List
                 && RelayProtocol.Parse(RelayProtocol.BuildDrop("123456")).Code == "123456"
                 && RelayProtocol.Parse(RelayProtocol.BuildPing()).Kind == RelayKind.Ping
-                && RelayProtocol.Parse(RelayProtocol.BuildPong()).Kind == RelayKind.Pong
+                && RelayProtocol.Parse(RelayProtocol.BuildPong("T32", 3, 15)).Kind == RelayKind.Pong
                 && RelayProtocol.Parse(RelayProtocol.BuildError("passwd")).Error == "passwd");
+            Check("LIST 带上的令牌原样解回（空令牌也要能解成空，那是拒绝的依据）",
+                RelayProtocol.Parse(RelayProtocol.BuildList("AB12CD34")).Token == "AB12CD34"
+                && RelayProtocol.Parse(RelayProtocol.BuildList("")).Token == ""
+                && RelayProtocol.Parse("LIST").Token == "",
+                "token=" + RelayProtocol.Parse(RelayProtocol.BuildList("AB12CD34")).Token);
+            var pong = RelayProtocol.Parse(RelayProtocol.BuildPong("AB12CD34", 3, 15));
+            Check("PONG 把令牌/当前房数/容量一起带到（左列那行与版本提示都靠它）",
+                pong.Kind == RelayKind.Pong && pong.Token == "AB12CD34" && pong.Count == 3
+                && pong.Capacity == 15 && pong.Ctl == RelayProtocol.Version,
+                "token=" + pong.Token + " rooms=" + pong.Count + " cap=" + pong.Capacity);
+            var errVer = RelayProtocol.Parse(RelayProtocol.BuildError(RelayError.Old, "19"));
+            Check("ERR 能带一个版本号当细节（否则玩家只看到\"版本不同\"四个大字）",
+                errVer.Error == "old" && errVer.Detail == "19", "detail=" + errVer.Detail);
 
             var rooms = new List<RelayRoomInfo>
             {
@@ -1285,6 +1313,25 @@ namespace PGvZOnlineVerify
         /// 端口每次现挑：上一轮残留的僵尸中继占着控制口时，新实例会绑不上，
         /// 而测试会对着旧进程一路绿灯（这个坑真踩过）。
         /// </summary>
+        /// <summary>
+        /// 向中继探活一次，把 LIST 要用的令牌拿到手。令牌是 PONG 发下来的，
+        /// 所以这里必须真的等到 Pong 落进 RelayClient.Token——发裸 LIST 只会换回一句 ERR|token。
+        /// </summary>
+        private static bool FetchRelayToken(PGvZOnlineMod.Net.RelayClient ctl, int timeoutMs = 3000)
+        {
+            var msgs = new List<RelayMessage>();
+            ctl.NotePing();
+            ctl.Send(RelayProtocol.BuildPing());
+            var sw = Stopwatch.StartNew();
+            while (ctl.Token.Length == 0 && sw.ElapsedMilliseconds < timeoutMs)
+            {
+                Thread.Sleep(20);
+                msgs.Clear();
+                ctl.Poll(msgs);
+            }
+            return ctl.Token.Length > 0;
+        }
+
         private static void TestRelayEndToEnd()
         {
             Console.WriteLine("-- 中继端到端 --");
@@ -1341,7 +1388,7 @@ namespace PGvZOnlineVerify
                     if (sw.ElapsedMilliseconds > nextPing)
                     {
                         nextPing = (int)sw.ElapsedMilliseconds + 400;
-                        clientCtl.Send(RelayProtocol.BuildHost("离线门主机", "pw1"));
+                        clientCtl.Send(RelayProtocol.BuildHost("离线门主机", "pw1", ProtocolVersion.Current));
                     }
                     got.Clear();
                     clientCtl.Poll(got);
@@ -1471,7 +1518,11 @@ namespace PGvZOnlineVerify
                 Check("主机的回包各归各的（点对点寻址，没有串成广播）", AllDown(),
                     "down=" + string.Join(",", down.Select(d => Convert.ToString(d, 2))));
 
-                clientCtl.Send(RelayProtocol.BuildList());
+                Check("端到端：PING 之后拿得到 LIST 要的令牌", FetchRelayToken(clientCtl),
+                    "令牌长度=" + clientCtl.Token.Length);
+                Check("端到端：PONG 里量到了往返时间（左列那行的数就从这来）",
+                    clientCtl.RoundtripMs >= 0, "rtt=" + clientCtl.RoundtripMs + "ms");
+                clientCtl.Send(RelayProtocol.BuildList(clientCtl.Token));
                 bool listed = false;
                 string listedInfo = "";
                 sw.Restart();
@@ -1513,7 +1564,7 @@ namespace PGvZOnlineVerify
                 Thread.Sleep(60);
                 got.Clear();
                 clientCtl.Poll(got);
-                clientCtl.Send(RelayProtocol.BuildList());
+                clientCtl.Send(RelayProtocol.BuildList(clientCtl.Token));
                 Thread.Sleep(120);
                 got.Clear();
                 clientCtl.Poll(got);
@@ -1535,7 +1586,7 @@ namespace PGvZOnlineVerify
 
                 // 重复 HOST 必须复用同一个房间：应答丢一个包主机就会重发，
                 // 每次重发都新建的话几秒内就把整台服务器的房间位占满（后来的人只收到 ERR|full）
-                clientCtl.Send(RelayProtocol.BuildHost("离线门主机", "pw1"));
+                clientCtl.Send(RelayProtocol.BuildHost("离线门主机", "pw1", ProtocolVersion.Current));
                 string again = null;
                 sw.Restart();
                 while (again == null && sw.Elapsed.TotalSeconds < 4)
@@ -1701,6 +1752,145 @@ namespace PGvZOnlineVerify
         /// 客人经房号连上、加入别人房间时才真去 StartJoining、填错房号要给对提示、
         /// 离开时把中继上的房间放掉。这些正是"游戏里点一下没反应"会藏的地方。
         /// </summary>
+        /// <summary>
+        /// 公网那三道只能由服务端守的门：控制协议版本、LIST 令牌、房间密码限速。
+        ///
+        /// 单独起一台中继跑：密码限速是**按来源地址**计数的，本机所有用例的地址都是 127.0.0.1，
+        /// 跟别的用例共用一个进程就会互相污染计数与令牌，测出来的绿一个都不作数。
+        /// </summary>
+        private static void TestRelayGates()
+        {
+            Console.WriteLine("-- 中继公网闸门 --");
+            string relayDll = FindRelayDll();
+            if (relayDll == null)
+            {
+                Check("公网闸门：找得到 PGvZRelay.dll", false, "先 dotnet build RelayServer -c Release");
+                return;
+            }
+            int block = FreeUdpBlock(8);
+            int control = FreeUdpPortExcept(block, 8);
+            var relay = StartRelayProcess(relayDll, control, block);
+            var ctl = new PGvZOnlineMod.Net.RelayClient();
+            var peer = new PGvZOnlineMod.Net.RelayClient();
+            var msgs = new List<RelayMessage>();
+            int cur = ProtocolVersion.Current;
+
+            string ErrText(RelayMessage m)
+                => m.Kind == RelayKind.Err
+                    ? "ERR|" + m.Error + (m.Detail.Length > 0 ? "|" + m.Detail : "")
+                    : m.Kind.ToString();
+
+            // 一句进、只等一条出：公网路径就是这个形状，"发三条再一起收"的写法测不出顺序问题
+            RelayMessage Ask(PGvZOnlineMod.Net.RelayClient c, string line)
+            {
+                c.Send(line);
+                var sw = Stopwatch.StartNew();
+                while (sw.Elapsed.TotalSeconds < 5)
+                {
+                    msgs.Clear();
+                    c.Poll(msgs);
+                    if (msgs.Count > 0)
+                    {
+                        return msgs[0];
+                    }
+                    Thread.Sleep(15);
+                }
+                return default;
+            }
+
+            try
+            {
+                ctl.Open("127.0.0.1", control);
+                peer.Open("127.0.0.1", control);
+
+                var bare = Ask(ctl, "HOST|旧模组主机|pw");
+                Check("不带控制协议版本的 HOST 被拒（旧模组不会静默建出一个房）",
+                    bare.Kind == RelayKind.Err && bare.Error == RelayError.OldCtl, ErrText(bare));
+
+                var made = Ask(ctl, RelayProtocol.BuildHost("闸门房", "gate123", cur));
+                string code = made.Kind == RelayKind.Room ? made.Code : "";
+                Check("带版本号的 HOST 建房成功", code.Length == 6, "code=" + code + " " + ErrText(made));
+                if (code.Length != 6)
+                {
+                    return; // 后面每条都挂在这个房上，没房就别再报一串假失败
+                }
+
+                var lo = Ask(peer, RelayProtocol.BuildJoin(code, "gate123", cur - 1));
+                Check("客人比房主旧 → ERR|old，并把房主的版本带回来",
+                    lo.Kind == RelayKind.Err && lo.Error == RelayError.Old && lo.Detail == cur.ToString(),
+                    ErrText(lo));
+                var hi = Ask(peer, RelayProtocol.BuildJoin(code, "gate123", cur + 1));
+                Check("客人比房主新 → ERR|new（双向都拦，只拦一边等于换个方向继续踩）",
+                    hi.Kind == RelayKind.Err && hi.Error == RelayError.New && hi.Detail == cur.ToString(),
+                    ErrText(hi));
+                var eq = Ask(peer, RelayProtocol.BuildJoin(code, "gate123", cur));
+                Check("版本相同放行", eq.Kind == RelayKind.Ok, ErrText(eq));
+
+                bool gotToken = FetchRelayToken(ctl);
+                Check("令牌来自 PONG（不是客户端自己编的）", gotToken && ctl.Token.Length > 0,
+                    "令牌长度=" + ctl.Token.Length);
+
+                var naked = Ask(peer, "LIST");
+                Check("不带令牌的 LIST 被拒", naked.Kind == RelayKind.Err && naked.Error == RelayError.Token,
+                    ErrText(naked));
+                var forged = Ask(peer, RelayProtocol.BuildList(ctl.Token));
+                Check("拿别的来源的令牌冒充 → 同样被拒",
+                    forged.Kind == RelayKind.Err && forged.Error == RelayError.Token, ErrText(forged));
+
+                var listed = Ask(ctl, RelayProtocol.BuildList(ctl.Token));
+                bool named = listed.Kind == RelayKind.Rooms && listed.Rooms != null
+                    && listed.Rooms.Any(r => r.Code == code && r.RoomName == "闸门房");
+                Check("持令牌的 LIST 给出房间表，且版本号没串进房名", named, ErrText(listed));
+
+                // 放大这件事只能量字节数：断言"被拒了"不够，被拒的应答要是还比请求大就没治住
+                using (var raw = new UdpClient(AddressFamily.InterNetwork))
+                {
+                    raw.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+                    byte[] req = Encoding.UTF8.GetBytes("LIST");
+                    raw.Send(req, req.Length, new IPEndPoint(IPAddress.Loopback, control));
+                    raw.Client.ReceiveTimeout = 4000;
+                    var from = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] rep = raw.Receive(ref from);
+                    Check("没有令牌那一路的应答不超过 16 字节（满房时原来是 336 字节的 ROOMS）",
+                        rep.Length <= 16, rep.Length + " 字节：" + Encoding.UTF8.GetString(rep));
+                }
+
+                // 限速按来源地址计数，本机所有用例共用一个地址，所以这段放最后
+                string last = "";
+                for (int i = 0; i < RelayProtocol.MaxPasswdFails; i++)
+                {
+                    last = ErrText(Ask(ctl, RelayProtocol.BuildJoin(code, "猜的密码" + i, cur)));
+                }
+                Check("上限之内错密码照常回 passwd（正常手滑不该被限速挡住）",
+                    last == "ERR|passwd", last);
+                var over = Ask(ctl, RelayProtocol.BuildJoin(code, "再猜一次", cur));
+                Check("越过上限转成 slow：不再给猜密码的人回可读的错误",
+                    over.Kind == RelayKind.Err && over.Error == RelayError.Slow, ErrText(over));
+                var rightPwd = Ask(ctl, RelayProtocol.BuildJoin(code, "gate123", cur));
+                Check("限速期间端对密码仍然放行——拦的是猜，不是手滑的人",
+                    rightPwd.Kind == RelayKind.Ok, ErrText(rightPwd));
+            }
+            catch (Exception ex)
+            {
+                Check("公网闸门全流程", false, ex.Message);
+            }
+            finally
+            {
+                ctl.Dispose();
+                peer.Dispose();
+                try
+                {
+                    if (relay != null && !relay.HasExited)
+                    {
+                        relay.Kill(true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
         private static void TestRelaySession()
         {
             Console.WriteLine("-- 会话接中继 --");
@@ -1737,7 +1927,8 @@ namespace PGvZOnlineVerify
 
                 // 另一个玩家从 LIST 里看得见这个房（联机页那一行就是这条数据）
                 peerCtl.Open("127.0.0.1", control);
-                peerCtl.Send(RelayProtocol.BuildList());
+                Check("别人探活拿到令牌", FetchRelayToken(peerCtl), "令牌长度=" + peerCtl.Token.Length);
+                peerCtl.Send(RelayProtocol.BuildList(peerCtl.Token));
                 RelayRoomInfo seen = default;
                 var msgs = new List<RelayMessage>();
                 var swl = Stopwatch.StartNew();
@@ -1767,7 +1958,7 @@ namespace PGvZOnlineVerify
 
                 // 真客人经房间号连进来，接住它的就是 Session 自己起的隧道
                 string guestPortReply = null;
-                peerCtl.Send(RelayProtocol.BuildJoin(code, "pw"));
+                peerCtl.Send(RelayProtocol.BuildJoin(code, "pw", ProtocolVersion.Current));
                 swl.Restart();
                 while (guestPortReply == null && swl.Elapsed.TotalSeconds < 5)
                 {
@@ -1802,7 +1993,7 @@ namespace PGvZOnlineVerify
                 int boundBefore = PGvZOnlineMod.Sync.Session.Net.BoundPort;
                 PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
                 PumpUntil(() => false, 300);
-                peerCtl.Send(RelayProtocol.BuildList());
+                peerCtl.Send(RelayProtocol.BuildList(peerCtl.Token));
                 bool gone = false;
                 swl.Restart();
                 while (!gone && swl.Elapsed.TotalSeconds < 5)
@@ -1827,7 +2018,7 @@ namespace PGvZOnlineVerify
                 _ = boundBefore;
 
                 // 填一个不存在的房号：提示要指名道姓，不能是一句"连接失败"
-                peerCtl.Send(RelayProtocol.BuildHost("别人的房", ""));
+                peerCtl.Send(RelayProtocol.BuildHost("别人的房", "", ProtocolVersion.Current));
                 string otherCode = null;
                 swl.Restart();
                 while (otherCode == null && swl.Elapsed.TotalSeconds < 5)

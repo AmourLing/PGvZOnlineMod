@@ -646,6 +646,17 @@ namespace PGvZOnlineMod.Ui
             for (int i = 0; i < _serverRows.Count && i < _geom.ServerRowsFit; i++)
             {
                 var r = _serverRows[i];
+                // 选中的那台中继一旦量到往返时间，这行右半边就换成实时读数：左列才是比较几台中继的地方，
+                // "32ms · 3/15 房" 比地址有用。一次 PONG 都没收到时退回显示地址，不编数。
+                string sub = r.Sub;
+                if (r.Entry != null && i == _sel)
+                {
+                    string quality = Sync.Session.RelayQuality;
+                    if (quality.Length > 0)
+                    {
+                        sub = quality;
+                    }
+                }
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.ServerRow,
@@ -655,7 +666,7 @@ namespace PGvZOnlineMod.Ui
                     H = LobbyGeom.ServerRowH,
                     Id = r.IsManual ? ManualRowId : ServerRowIdBase + i,
                     Main = Clip(r.Label, 11),
-                    Right = r.Sub,
+                    Right = sub,
                     Selected = i == _sel,
                 });
             }

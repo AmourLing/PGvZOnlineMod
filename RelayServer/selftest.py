@@ -15,6 +15,13 @@
   4) 控制协议：HOST/SEEN/JOIN/LIST 的字段对得上，房间列表能反映关卡与人数
   5) 建房密码：错密码被拒、对密码放行；LIST 里标出"要密码"
   6) 房间空闲后被回收，回收出来的端口段能被下一个房间重新绑上
+  7) 公网那三道闸门：不带控制协议版本的 HOST 被拒、游戏协议双向不匹配被拒、
+     没有令牌的 LIST 被拒且应答更小、密码连错越过上限转 slow
+  8) PONG 带回来的房数与容量同 LIST 的条数一致（联机页左列那行靠的就是这个一致性）
+
+v2 的两处形状：版本号一律追加在字段尾部；LIST 要带 PONG 发下来的令牌。
+控制协议版本与游戏协议版本都从 src/ 里的源文件读出来，不在这份脚本里另抄一遍——
+抄的那份会随升号漂，漂了还一路绿灯是最坏的结果。
 
 端口一律每次运行现挑（空闲端口 + 连续端口段），这样上一轮没清干净的僵尸中继
 不可能被这一轮误当成被测对象——真出过一次：旧实例占着 27270，新实例控制线程炸了，
@@ -27,6 +34,7 @@
 """
 import os
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -42,6 +50,50 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DLL = os.path.join(HERE, "bin", "Release", "net6.0", "PGvZRelay.dll")
 if not os.path.exists(DLL):
     DLL = os.path.join(HERE, "bin", "Debug", "net6.0", "PGvZRelay.dll")
+
+SRC = os.path.join(os.path.dirname(HERE), "src", "Protocol")
+
+
+def source_const(path, name):
+    """把权威源文件里的 const int 读出来；读不到返回 None，由调用方报失败，绝不退回猜值。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = re.search(r"const\s+int\s+" + name + r"\s*=\s*(\d+)", text)
+    return m.group(1) if m else None
+
+
+# 版本号只认这一个来源：脚本里再抄一份数字，升号之后这份自测会绿得毫无意义
+CTL = source_const(os.path.join(SRC, "RelayProtocol.cs"), "Version")
+GAME = source_const(os.path.join(SRC, "Packets.cs"), "Current")
+PW_LIMIT = source_const(os.path.join(SRC, "RelayProtocol.cs"), "MaxPasswdFails")
+
+PING_LINE = "PING|" + (CTL or "")
+
+
+def host_line(name, pwd, game=None):
+    return "HOST|%s|%s|%s|%s" % (name, pwd, CTL, GAME if game is None else game)
+
+
+def join_line(code, pwd, game=None):
+    return "JOIN|%s|%s|%s|%s" % (code, pwd, CTL, GAME if game is None else game)
+
+
+def list_line(token=""):
+    return "LIST|" + token
+
+
+def get_token(ctl):
+    """令牌由 PONG 发下来：拿不到就返回空串，后面的 LIST 会当场失败而不是悄悄跳过。"""
+    f = talk(ctl, PING_LINE).split("|")
+    return f[2] if len(f) >= 5 and f[0] == "PONG" else ""
+
+
+def rooms(ctl):
+    """先探活拿令牌再要房间表——这两步现在是绑在一起的。"""
+    return parse_rooms(talk(ctl, list_line(get_token(ctl))))
 
 MAX_ROOMS = 5
 IDLE = 4
@@ -175,7 +227,7 @@ def run(proc, ctl):
     guard(proc)
 
     # ---------- 建房 ----------
-    r = talk(ctl, "HOST|测试主机|")
+    r = talk(ctl, host_line("测试主机", ""))
     f = r.split("|")
     ok = len(f) == 4 and f[0] == "ROOM"
     check("HOST 建房返回 ROOM|码|guest口|host口", ok, r)
@@ -207,7 +259,7 @@ def run(proc, ctl):
     for i in range(3):
         g = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         g.bind((BIND_ANY, 0))
-        j = talk(ctl, "JOIN|%s|" % code)
+        j = talk(ctl, join_line(code, ""))
         if not j.startswith("OK|"):
             check("JOIN 客人%d" % (i + 1), False, j)
             guests.append((g, None, None))
@@ -235,7 +287,7 @@ def run(proc, ctl):
     # ---------- SEEN / LIST ----------
     send(ctl, "SEEN|%s|7|2|4|" % code)
     time.sleep(0.2)
-    lst = parse_rooms(talk(ctl, "LIST"))
+    lst = rooms(ctl)
     room_a = next((x for x in lst["rooms"] if x["code"] == code), None) if lst else None
     check("SEEN 之后 LIST 反映关卡与人数",
           room_a is not None and room_a["level"] == 7 and room_a["players"] == 2
@@ -243,16 +295,16 @@ def run(proc, ctl):
           str(room_a))
 
     # ---------- 建房密码 ----------
-    r2 = talk(ctl, "HOST|加密房|abc123")
+    r2 = talk(ctl, host_line("加密房", "abc123"))
     f2 = r2.split("|")
     check("带密码建房成功", len(f2) == 4 and f2[0] == "ROOM", r2)
     code2 = f2[1] if len(f2) == 4 else ""
-    lst2 = parse_rooms(talk(ctl, "LIST"))
+    lst2 = rooms(ctl)
     room_b = next((x for x in lst2["rooms"] if x["code"] == code2), None) if lst2 else None
     check("LIST 标出该房要密码", room_b is not None and room_b["locked"], str(room_b))
-    check("错密码被拒", talk(ctl, "JOIN|%s|wrong" % code2) == "ERR|passwd")
-    check("对密码放行", talk(ctl, "JOIN|%s|abc123" % code2).startswith("OK|"))
-    check("不存在的房间返回 noready", talk(ctl, "JOIN|000000|") == "ERR|noready")
+    check("错密码被拒", talk(ctl, join_line(code2, "wrong")) == "ERR|passwd")
+    check("对密码放行", talk(ctl, join_line(code2, "abc123")).startswith("OK|"))
+    check("不存在的房间返回 noready", talk(ctl, join_line("000000", "")) == "ERR|noready")
     guard(proc)
 
     for g, _, _ in guests:
@@ -268,10 +320,10 @@ def run(proc, ctl):
     if REMOTE:
         # 公网模式不等回收，改验"主动 DROP 立刻放掉房间"——主机离开房间走的就是这条，
         # 不生效的后果是别人 LIST 里全是不存在的空房
-        before = parse_rooms(talk(ctl, "LIST"))
-        talk(ctl, "DROP|%s|" % code)
+        before = rooms(ctl)
+        talk(ctl, "DROP|%s" % code)
         time.sleep(0.3)
-        after = parse_rooms(talk(ctl, "LIST"))
+        after = rooms(ctl)
         check("公网：主动 DROP 立刻把房间放掉",
               before and after and after["count"] < before["count"],
               "%s → %s" % (before and before["count"], after and after["count"]))
@@ -279,7 +331,7 @@ def run(proc, ctl):
     deadline = time.time() + IDLE + 16.0
     lst3 = None
     while time.time() < deadline:
-        lst3 = parse_rooms(talk(ctl, "LIST"))
+        lst3 = rooms(ctl)
         if lst3 and lst3["count"] == 0:
             break
         time.sleep(1.0)
@@ -287,12 +339,83 @@ def run(proc, ctl):
 
     # 回收的槽位号不保证按顺序回来（FreeIndex 是无序集合），所以只验"新房间能在同一段里
     # 把两个端口重新绑上"——绑不上就返回 ERR|full，这才是复用能力真正的证据。
-    r3 = talk(ctl, "HOST|第二个主机|")
+    r3 = talk(ctl, host_line("第二个主机", ""))
     f3 = r3.split("|")
     check("回收后端口段能被新房间重新占用",
           len(f3) == 4 and f3[0] == "ROOM" and BASE <= int(f3[2]) < BASE + MAX_ROOMS * 2
           and int(f3[2]) == int(f3[3]) + 1, r3)
-    check("新房间只有自己一个", (parse_rooms(talk(ctl, "LIST")) or {}).get("count") == 1)
+    check("新房间只有自己一个", (rooms(ctl) or {}).get("count") == 1)
+
+
+def gates(proc, ctl):
+    """公网那三道只能服务端守的门。
+
+    放在最后跑：密码限速是**按来源地址**计数的，本机这些 socket 的地址全是同一个，
+    这段先跑的话上面那些正常用例会被自己的限速挡掉。
+    """
+    print("--- 公网闸门 ---")
+    guard(proc)
+
+    r = talk(ctl, "HOST|旧模组|pw")
+    check("不带控制协议版本的 HOST 被拒（旧模组不会静默建出一个没人管得住的房）",
+          r == "ERR|oldctl", r)
+    # 用"LIST 里有没有这个房名"当证据，而不是比房间总数：本地那台的空闲回收只有 4 秒，
+    # 比总数会撞上别的房间正好在这中间被回收，红一条假失败
+    names = [x["name"] for x in (rooms(ctl) or {}).get("rooms", [])]
+    check("被拒的 HOST 没建出房来（列表里找不到它）", "旧模组" not in names, str(names))
+
+    f = talk(ctl, host_line("闸门房", "gate123")).split("|")
+    ok = len(f) == 4 and f[0] == "ROOM"
+    check("带版本号的 HOST 建房成功", ok, str(f))
+    if not ok:
+        return
+    gcode = f[1]
+
+    lo = talk(ctl, join_line(gcode, "gate123", str(int(GAME) - 1)))
+    check("客人比房主旧 → ERR|old，并把房主的版本带回来", lo == "ERR|old|%s" % GAME, lo)
+    hi = talk(ctl, join_line(gcode, "gate123", str(int(GAME) + 1)))
+    check("客人比房主新 → ERR|new（双向都拦，只拦一边等于换个方向继续踩）",
+          hi == "ERR|new|%s" % GAME, hi)
+    check("版本相同放行", talk(ctl, join_line(gcode, "gate123")).startswith("OK|"), "")
+
+    naked = talk(ctl, "LIST")
+    check("不带令牌的 LIST 被拒", naked == "ERR|token", naked)
+    size = len(naked.encode("utf-8"))
+    check("那一路的应答不超过 16 字节（满房时 ROOMS 是 336 字节，这就是放大的那一面）",
+          size <= 16, "%d 字节：%s" % (size, naked))
+    tok = get_token(ctl)
+    check("令牌确实由 PONG 发下来（不是脚本自己编的）", len(tok) >= 6, "长度=%d" % len(tok))
+
+    other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    other.bind((BIND_ANY, 0))          # 另一个来源端点：令牌是按端点发的
+    stolen = talk(other, list_line(tok))
+    check("拿别的来源的令牌冒充 → 同样被拒", stolen == "ERR|token", stolen)
+    other.close()
+
+    got = parse_rooms(talk(ctl, list_line(tok)))
+    names = [x["name"] for x in got["rooms"]] if got else []
+    check("持自己那枚令牌 LIST 得到房间表", got is not None and gcode in [x["code"] for x in got["rooms"]],
+          str(got))
+    check("尾部那两个版本号没串进房名", "闸门房" in names, str(names))
+
+    pong = talk(ctl, PING_LINE).split("|")
+    listed = parse_rooms(talk(ctl, list_line(pong[2]))) if len(pong) >= 5 else None
+    check("PONG 里的房数与 LIST 的条数一致（左列那行 "
+          "3/15 才不是编的）",
+          len(pong) >= 5 and listed is not None and int(pong[3]) == listed["count"] and int(pong[4]) > 0,
+          "pong=%s list=%s" % (pong[3:5] if len(pong) >= 5 else pong, listed and listed["count"]))
+
+    last = ""
+    for i in range(int(PW_LIMIT)):
+        last = talk(ctl, join_line(gcode, "猜的密码%d" % i))
+    check("上限之内错密码照常回 passwd（正常手滑不该被限速挡住）", last == "ERR|passwd", last)
+    over = talk(ctl, join_line(gcode, "再猜一次"))
+    check("越过上限转成 slow：不再给猜密码的人回可读的错误", over == "ERR|slow", over)
+    right = talk(ctl, join_line(gcode, "gate123"))
+    check("限速期间端对密码仍然放行——拦的是猜，不是手滑的人", right.startswith("OK|"), right)
+
+    talk(ctl, "DROP|%s" % gcode)
+    guard(proc)
 
 
 def main():
@@ -324,9 +447,14 @@ def main():
 
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        check("自测从源文件读到了权威版本号", bool(CTL and GAME and PW_LIMIT),
+              "控制协议=%s 游戏协议=%s 密码上限=%s" % (CTL, GAME, PW_LIMIT))
+        if not (CTL and GAME and PW_LIMIT):
+            print("读不到 src/Protocol 里的版本号，后面每条断言都不成立——直接收工")
+            return 2
         for _ in range(40):
             try:
-                if talk(ctl, "PING") == "PONG":
+                if talk(ctl, PING_LINE).split("|")[0] == "PONG":
                     break
             except Exception:
                 if proc is not None and proc.poll() is not None:
@@ -338,6 +466,7 @@ def main():
         check("中继启动", True, "控制口 %d" % CONTROL)
 
         run(proc, ctl)
+        gates(proc, ctl)
     except RelayDead as e:
         check("中继全程存活", False, str(e))
     finally:

@@ -30,6 +30,17 @@ namespace PGvZOnlineMod.Net
         /// <summary>最后一次收到应答的时刻（Environment.TickCount 毫秒），用来判"这服务器还活着吗"。</summary>
         public int LastReplyMs { get; private set; } = -100000;
 
+        /// <summary>中继发下来的一次性令牌，LIST 要带它；还没收到 PONG 时是空串。</summary>
+        public string Token { get; private set; } = "";
+
+        /// <summary>上一次 PING→PONG 的往返毫秒数；-1 = 一次都没量到（左列那行就不显示延迟，不编数）。</summary>
+        public int RoundtripMs { get; private set; } = -1;
+
+        private int _pingSentAt = -1;
+
+        /// <summary>发出 PING 时叫一声：往返时间是拿本端自己的钟量的，不需要服务器带时间戳。</summary>
+        public void NotePing() => _pingSentAt = Environment.TickCount;
+
         /// <summary>解析后的服务端点；主机侧隧道要拿它的地址去配中继的 hostPort。</summary>
         public IPEndPoint Server => _server;
 
@@ -131,6 +142,16 @@ namespace PGvZOnlineMod.Net
                     {
                         continue; // 不是我们的报文（端口被人占了之类），忽略
                     }
+                    if (msg.Kind == RelayKind.Pong)
+                    {
+                        Token = msg.Token ?? "";
+                        if (_pingSentAt >= 0)
+                        {
+                            // unchecked：开机超过 25 天后 TickCount 会翻负，同源的相减仍然对
+                            RoundtripMs = unchecked(Environment.TickCount - _pingSentAt);
+                            _pingSentAt = -1;
+                        }
+                    }
                     Alive = true;
                     LastReplyMs = Environment.TickCount;
                     into.Add(msg);
@@ -151,6 +172,9 @@ namespace PGvZOnlineMod.Net
             _sock = null;
             _server = null;
             Alive = false;
+            Token = "";
+            RoundtripMs = -1;
+            _pingSentAt = -1;
         }
 
         public void Dispose() => Close();

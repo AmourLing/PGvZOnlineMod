@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using PGvZOnlineMod.Protocol;
 
@@ -20,6 +21,11 @@ namespace PGvZRelay
     /// 客人的 Lidgren 客户端才不会觉得对端变了。
     ///
     /// 控制协议的定义不在这里——它链入模组的 src/Protocol/RelayProtocol.cs，两端共用一份，避免各写一套写串。
+    ///
+    /// 为什么只有 LIST 要令牌：满房时一次 LIST 是 4 字节请求换 336 字节应答（约 84 倍），
+    /// 这是这台机器唯一能被拿伪造源地址当反射放大器的地方。令牌只在 PONG 里发给真正的来源，
+    /// 伪造者收不到应答就拿不到令牌，LIST 只会回 9 字节的 ERR|token。HOST/JOIN 的应答本来就比
+    /// 请求大不到一倍，再卡一道只会给建房与加入这两条要命的路径多塞一次失败面，所以不卡。
     /// </summary>
     internal static class Program
     {
@@ -35,6 +41,24 @@ namespace PGvZRelay
         private static readonly ConcurrentBag<int> FreeIndex = new();
         private static readonly object Gate = new();
         private static int _rng = (Environment.TickCount ^ DateTime.Now.Second) & 0x7FFFFFFF;
+
+        /// <summary>按来源端点发的一次性令牌（LIST 的入场券，兼作反射放大的闸门）。</summary>
+        private static readonly ConcurrentDictionary<string, Grant> Grants = new();
+
+        /// <summary>按来源地址记的房间密码错误次数（换源端口不该把计数清零）。</summary>
+        private static readonly ConcurrentDictionary<string, Fails> PwFails = new();
+
+        private sealed class Grant
+        {
+            public string Token = "";
+            public DateTime Until;
+        }
+
+        private sealed class Fails
+        {
+            public int Count;
+            public DateTime Until;
+        }
 
         private static int Main(string[] args)
         {
@@ -69,7 +93,8 @@ namespace PGvZRelay
             }
 
             Log($"中继启动 控制={_controlPort} 端口段={_basePort}~{_basePort + _maxRooms * 2 - 1} " +
-                $"容量={_maxRooms}房 空闲回收={_idleSeconds}s");
+                $"容量={_maxRooms}房 空闲回收={_idleSeconds}s 控制协议=v{RelayProtocol.Version} " +
+                $"令牌={RelayProtocol.TokenTtlSeconds}s 密码限速={RelayProtocol.MaxPasswdFails}次/{RelayProtocol.PasswdWindowSeconds}s");
 
             new Thread(() => ControlLoop(control)) { IsBackground = true, Name = "control" }.Start();
             new Thread(ReapLoop) { IsBackground = true, Name = "reap" }.Start();
@@ -121,6 +146,12 @@ namespace PGvZRelay
             {
                 case RelayKind.Host:
                 {
+                    // 字段布局对不上就别往下猜：旧端不带版本号，按 v2 的含义去解它的报文只会静默错乱
+                    if (msg.Ctl < RelayProtocol.Version)
+                    {
+                        Log($"来自 {from.Address}:{from.Port} 的 HOST 不带控制协议版本，拒绝");
+                        return RelayProtocol.BuildError(RelayError.OldCtl);
+                    }
                     // 同一来源 + 同样的房名与密码才复用：应答丢包时主机必然原样重试，
                     // 每次重试都新建的话几个来回就把整台服务器的房间位占满，
                     // 后来的人只会收到 ERR|full（端到端用例踩到的就是这个）。
@@ -137,13 +168,13 @@ namespace PGvZRelay
                             return RelayProtocol.BuildRoom(exist.Code, exist.GuestPort, exist.HostPort);
                         }
                     }
-                    var room = CreateRoom(msg.Name, msg.Password, from);
+                    var room = CreateRoom(msg.Name, msg.Password, from, msg.GameVersion);
                     if (room == null)
                     {
                         Log("容量已满，拒绝建房");
-                        return RelayProtocol.BuildError("full");
+                        return RelayProtocol.BuildError(RelayError.Full);
                     }
-                    Log($"建房 {room.Code} 主机={room.RoomName} guest={room.GuestPort} " +
+                    Log($"建房 {room.Code} 主机={room.RoomName} 协议=v{room.GameVersion} guest={room.GuestPort} " +
                         $"host={room.HostPort}（当前 {Rooms.Count} 房）");
                     return RelayProtocol.BuildRoom(room.Code, room.GuestPort, room.HostPort);
                 }
@@ -158,20 +189,47 @@ namespace PGvZRelay
                 }
                 case RelayKind.Join:
                 {
+                    if (msg.Ctl < RelayProtocol.Version)
+                    {
+                        Log($"来自 {from.Address}:{from.Port} 的 JOIN 不带控制协议版本，拒绝");
+                        return RelayProtocol.BuildError(RelayError.OldCtl);
+                    }
                     if (!Rooms.TryGetValue(msg.Code, out var room))
                     {
-                        return RelayProtocol.BuildError("noready");
+                        return RelayProtocol.BuildError(RelayError.NoReady);
                     }
                     if (room.Locked && room.Password != RelayProtocol.Clean(msg.Password))
                     {
+                        if (NotePwFail(from))
+                        {
+                            // 房间码是 6 位数字、一次请求就能试一个，不限速的话"要密码"只是装饰
+                            Log($"{room.Code} 密码错误超过 {RelayProtocol.MaxPasswdFails} 次，暂时不应答 {from.Address}");
+                            return RelayProtocol.BuildError(RelayError.Slow);
+                        }
                         Log($"{room.Code} 密码不对，拒绝 {from.Address}:{from.Port}");
-                        return RelayProtocol.BuildError("passwd");
+                        return RelayProtocol.BuildError(RelayError.Passwd);
                     }
+                    // 版本比对放在密码之后：先确认来路，再把房主的版本号透出去。
+                    // 这一步拦在 Lidgren 握手之前，双方看到的会是"版本差多少"而不是干等超时。
+                    if (room.GameVersion != msg.GameVersion)
+                    {
+                        string reason = msg.GameVersion < room.GameVersion ? RelayError.Old : RelayError.New;
+                        Log($"{room.Code} 版本不匹配：客人=v{msg.GameVersion} 房主=v{room.GameVersion}");
+                        return RelayProtocol.BuildError(reason, room.GameVersion.ToString());
+                    }
+                    ClearPwFail(from);
                     room.Touch();
                     return RelayProtocol.BuildOk(room.GuestPort);
                 }
                 case RelayKind.List:
+                {
+                    // 令牌对不上就只回这一句：应答比请求还小，伪造源地址从这里得不到放大
+                    if (!SpendToken(msg.Token, from))
+                    {
+                        return RelayProtocol.BuildError(RelayError.Token);
+                    }
                     return RelayProtocol.BuildRooms(Snapshot());
+                }
                 case RelayKind.Drop:
                 {
                     if (Rooms.TryGetValue(msg.Code, out var room))
@@ -180,14 +238,14 @@ namespace PGvZRelay
                         if (!Same(room.Owner, from))
                         {
                             Log($"{room.Code} 的 DROP 来自非房主 {from.Address}:{from.Port}，拒绝");
-                            return RelayProtocol.BuildError("noperm");
+                            return RelayProtocol.BuildError(RelayError.NoPerm);
                         }
                         CloseRoom(room, "主机主动关闭");
                     }
                     return "OK";
                 }
                 case RelayKind.Ping:
-                    return RelayProtocol.BuildPong();
+                    return RelayProtocol.BuildPong(IssueToken(from), Rooms.Count, _maxRooms);
                 default:
                     return null;
             }
@@ -203,7 +261,7 @@ namespace PGvZRelay
             return list;
         }
 
-        private static Room CreateRoom(string hostName, string password, IPEndPoint owner)
+        private static Room CreateRoom(string hostName, string password, IPEndPoint owner, int gameVersion)
         {
             lock (Gate)
             {
@@ -220,7 +278,7 @@ namespace PGvZRelay
                 while (Rooms.ContainsKey(code));
 
                 var room = new Room(code, _basePort + k * 2 + 1, _basePort + k * 2, k,
-                    string.IsNullOrEmpty(hostName) ? "host" : hostName, password)
+                    string.IsNullOrEmpty(hostName) ? "host" : hostName, password, gameVersion)
                 {
                     Owner = owner,
                 };
@@ -251,6 +309,54 @@ namespace PGvZRelay
         internal static bool Same(IPEndPoint a, IPEndPoint b)
             => a != null && b != null && a.Address.Equals(b.Address) && a.Port == b.Port;
 
+        // ------------------------------------------------------------ 令牌与限速
+
+        /// <summary>发一张新令牌并续期。客户端每 5 秒 PING 一次，令牌就是在这条路上一直续着的。</summary>
+        private static string IssueToken(IPEndPoint from)
+        {
+            var g = Grants.GetOrAdd(from.Address.ToString() + ":" + from.Port, _ => new Grant());
+            // 用加密随机数而不是房间里那台 LCG：令牌的全部价值就在于伪造源地址的人算不出它
+            g.Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(4));
+            g.Until = DateTime.Now.AddSeconds(RelayProtocol.TokenTtlSeconds);
+            return g.Token;
+        }
+
+        /// <summary>
+        /// 验令牌，对上了顺手续期。按完整端点认人：NAT 重新绑定会换源端口，
+        /// 那时旧令牌作废——客户端收到 ERR|token 会立刻重发 PING 拿新的，不会卡成红字。
+        /// </summary>
+        private static bool SpendToken(string token, IPEndPoint from)
+        {
+            if (token.Length == 0
+                || !Grants.TryGetValue(from.Address.ToString() + ":" + from.Port, out var g)
+                || g.Token != token || DateTime.Now > g.Until)
+            {
+                return false;
+            }
+            g.Until = DateTime.Now.AddSeconds(RelayProtocol.TokenTtlSeconds);
+            return true;
+        }
+
+        /// <summary>记一次密码错误；返回 true 表示这一下已经越过限速线，不该再应答了。</summary>
+        private static bool NotePwFail(IPEndPoint from)
+        {
+            string key = from.Address.ToString();
+            var f = PwFails.GetOrAdd(key, _ => new Fails
+            {
+                Until = DateTime.Now.AddSeconds(RelayProtocol.PasswdWindowSeconds),
+            });
+            if (DateTime.Now > f.Until)
+            {
+                f.Count = 0;
+                f.Until = DateTime.Now.AddSeconds(RelayProtocol.PasswdWindowSeconds);
+            }
+            f.Count++;
+            return f.Count > RelayProtocol.MaxPasswdFails;
+        }
+
+        private static void ClearPwFail(IPEndPoint from)
+            => PwFails.TryRemove(from.Address.ToString(), out _);
+
         private static void ReapLoop()
         {
             while (true)
@@ -261,6 +367,23 @@ namespace PGvZRelay
                     if (room.IdleSeconds > _idleSeconds)
                     {
                         CloseRoom(room, $"空闲 {room.IdleSeconds}s");
+                    }
+                }
+                // 令牌与限速的表只靠访问时判断过期会一直涨（公网机器上扫描过的地址是无限的）
+                foreach (var kv in Grants)
+                {
+                    if (DateTime.Now > kv.Value.Until)
+                    {
+                        Grant dropped;
+                        Grants.TryRemove(kv.Key, out dropped);
+                    }
+                }
+                foreach (var kv in PwFails)
+                {
+                    if (DateTime.Now > kv.Value.Until)
+                    {
+                        Fails dropped;
+                        PwFails.TryRemove(kv.Key, out dropped);
                     }
                 }
             }
@@ -279,6 +402,8 @@ namespace PGvZRelay
         public int Index { get; }
         public string RoomName { get; }
         public string Password { get; }
+        /// <summary>房主上报的游戏协议版本：客人 JOIN 时与它比对，不一致就在握手之前拒掉。</summary>
+        public readonly int GameVersion;
         /// <summary>建房者的端点：重复 HOST 复用它、DROP 也只认它。</summary>
         public IPEndPoint Owner;
         public bool Locked => Password.Length > 0;
@@ -293,7 +418,8 @@ namespace PGvZRelay
         private int _players = 1;
         private int _maxPlayers = Program.MaxSlots + 1;
 
-        public Room(string code, int guestPort, int hostPort, int index, string roomName, string password)
+        public Room(string code, int guestPort, int hostPort, int index, string roomName, string password,
+            int gameVersion)
         {
             Code = code;
             GuestPort = guestPort;
@@ -301,6 +427,7 @@ namespace PGvZRelay
             Index = index;
             RoomName = roomName;
             Password = RelayProtocol.Clean(password);
+            GameVersion = gameVersion;
             for (int i = 0; i < _slots.Length; i++)
             {
                 _slots[i] = new Slot();

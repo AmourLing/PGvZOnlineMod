@@ -997,6 +997,11 @@ namespace PGvZOnlineMod.Sync
         private static string _pendingJoinPwd = "";
         private static bool _relayGotReply;
         private static bool _relayWarned;
+        // LIST 要带令牌，而令牌是 PONG 发下来的：选中服务器那一下先探活，PONG 回来才补发 LIST。
+        // 两个包紧挨着发出去的话，LIST 有几率排在 PING 前到，列表就空着要等下一次刷新。
+        private static bool _relayListQueued;
+        private static int _relayRoomCount;
+        private static int _relayCapacity;
         private const double RelayTimeout = 6.0;
 
         /// <summary>中继 LIST 回来的房间（联机页右列在"选中继"时显示的就是它）。</summary>
@@ -1009,6 +1014,22 @@ namespace PGvZOnlineMod.Sync
 
         /// <summary>开出来的主机侧隧道条数（离线用例用它确认"三个客人都接得住"）。</summary>
         public static int RelayTunnelCount => _tunnels.Count;
+
+        /// <summary>
+        /// 左列服务器行末尾那一小截："32ms · 3/15 房"。
+        /// 一次 PONG 都没收到时返回空串——没量到的数不编，那行退回显示地址。
+        /// </summary>
+        public static string RelayQuality
+        {
+            get
+            {
+                if (_relay == null || _relay.RoundtripMs < 0 || _relayCapacity <= 0)
+                {
+                    return "";
+                }
+                return _relay.RoundtripMs + "ms · " + _relayRoomCount + "/" + _relayCapacity + " 房";
+            }
+        }
 
         /// <summary>联机页选中某台中继：开控制通道、探活、拉一次房间列表。传 null 表示切回局域网。</summary>
         public static void RelaySelect(ServerEntry entry)
@@ -1033,8 +1054,9 @@ namespace PGvZOnlineMod.Sync
                 }
                 ModEnv.Log("连接中继 " + entry.Name + " " + entry.Host + ":" + entry.Port);
             }
+            _relay.NotePing();
             _relay.Send(RelayProtocol.BuildPing());
-            _relay.Send(RelayProtocol.BuildList());
+            _relayListQueued = true;
             _relayServedAt = _now;
             _relayGotReply = false;
             _relayWarned = false;
@@ -1049,7 +1071,17 @@ namespace PGvZOnlineMod.Sync
             {
                 return;
             }
-            _relay.Send(RelayProtocol.BuildList());
+            if (_relay.Token.Length == 0)
+            {
+                // 手点刷新时还没拿到过令牌：先探活拿一张，PONG 回来自动补 LIST
+                _relayListQueued = true;
+                _relay.NotePing();
+                _relay.Send(RelayProtocol.BuildPing());
+            }
+            else
+            {
+                _relay.Send(RelayProtocol.BuildList(_relay.Token));
+            }
             _nextListAt = _now + 2.0;
         }
 
@@ -1074,7 +1106,7 @@ namespace PGvZOnlineMod.Sync
             _relayCode = "";
             _hostReqAt = _now;
             _nextHostAt = _now + 2.0;
-            _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword));
+            _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword, ProtocolVersion.Current));
             _nextSeenAt = _now + 1.0;
             SetStatus("正在向中继登记房间…", false);
         }
@@ -1097,7 +1129,7 @@ namespace PGvZOnlineMod.Sync
             _pendingJoinPwd = RelayProtocol.Clean(password);
             _joinReqAt = _now;
             _nextJoinAt = _now + 2.0;
-            _relay.Send(RelayProtocol.BuildJoin(code, _pendingJoinPwd));
+            _relay.Send(RelayProtocol.BuildJoin(code, _pendingJoinPwd, ProtocolVersion.Current));
             SetStatus("正在加入房间 " + code + "…", false);
         }
 
@@ -1124,6 +1156,9 @@ namespace PGvZOnlineMod.Sync
             _nextJoinAt = 0;
             _relayGotReply = false;
             _relayWarned = false;
+            _relayListQueued = false;
+            _relayRoomCount = 0;
+            _relayCapacity = 0;
             if (RelayRooms.Count > 0)
             {
                 RelayRooms.Clear();
@@ -1185,7 +1220,7 @@ namespace PGvZOnlineMod.Sync
             if (Phase == SessionPhase.Idle && OnlineLobbyScreen.ScreenOpen && _now >= _nextListAt)
             {
                 _nextListAt = _now + 2.0;
-                _relay.Send(RelayProtocol.BuildList());
+                _relay.Send(RelayProtocol.BuildList(_relay.Token));
             }
             if (_relayHostSide && Phase == SessionPhase.HostingLobby && _relayCode.Length > 0
                 && _now >= _nextSeenAt)
@@ -1198,6 +1233,7 @@ namespace PGvZOnlineMod.Sync
             if (_now >= _nextPingAt)
             {
                 _nextPingAt = _now + 5.0;
+                _relay.NotePing();
                 _relay.Send(RelayProtocol.BuildPing());
             }
 
@@ -1208,12 +1244,12 @@ namespace PGvZOnlineMod.Sync
                 // 注意只推 _nextHostAt，不能动 _hostReqAt——那是超时提示的起点，
                 // 一起推就等于每次重试都把时钟清零，永远报不出"没人回"。
                 _nextHostAt = _now + 2.0;
-                _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword));
+                _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword, ProtocolVersion.Current));
             }
             if (_pendingJoinCode.Length > 0 && _now >= _nextJoinAt)
             {
                 _nextJoinAt = _now + 2.0;
-                _relay.Send(RelayProtocol.BuildJoin(_pendingJoinCode, _pendingJoinPwd));
+                _relay.Send(RelayProtocol.BuildJoin(_pendingJoinCode, _pendingJoinPwd, ProtocolVersion.Current));
             }
 
             _relayMsgs.Clear();
@@ -1269,8 +1305,31 @@ namespace PGvZOnlineMod.Sync
                         StartJoining(_app, _relayServed.Host, m.GuestPort);
                         break;
 
+                    case RelayKind.Pong:
+                        _relayRoomCount = m.Count;
+                        _relayCapacity = m.Capacity;
+                        if (_relayListQueued)
+                        {
+                            _relayListQueued = false;
+                            _relay.Send(RelayProtocol.BuildList(_relay.Token));
+                        }
+                        break;
+
                     case RelayKind.Err:
-                        OnRelayError(m.Error);
+                        if (m.Error == RelayError.Token)
+                        {
+                            // 令牌过期（多半是 NAT 重新绑定换了源端口）：立刻重探一次拿新的。
+                            // 这会自己好的事不该报成一条红字，但也不能装没事——装没事的表现是
+                            // "朋友刚建的房不出现在列表里"，那种查不出来的降级最贵。
+                            ModEnv.Log("中继令牌过期，重新探活");
+                            _relayListQueued = true;
+                            _relay.NotePing();
+                            _relay.Send(RelayProtocol.BuildPing());
+                        }
+                        else
+                        {
+                            OnRelayError(m.Error, m.Detail);
+                        }
                         break;
                 }
             }
@@ -1308,23 +1367,31 @@ namespace PGvZOnlineMod.Sync
             }
         }
 
-        private static void OnRelayError(string reason)
+        private static void OnRelayError(string reason, string detail)
         {
+            string peer = detail.Length > 0 ? "v" + detail : "另一头";
             string why = reason switch
             {
-                "passwd" => "房间密码不对",
-                "noready" => "没有这个房间号（对方还没建房，或房间已回收）",
-                "full" => "中继服务器房间满了",
-                "noperm" => "这个房间不是你建的，关不掉",
+                RelayError.Passwd => "房间密码不对",
+                RelayError.NoReady => "没有这个房间号（对方还没建房，或房间已回收）",
+                RelayError.Full => "中继服务器房间满了",
+                RelayError.NoPerm => "这个房间不是你建的，关不掉",
+                RelayError.Slow => "密码连续错 " + RelayProtocol.MaxPasswdFails + " 次，"
+                                   + RelayProtocol.PasswdWindowSeconds + " 秒之内服务器不再应答",
+                RelayError.OldCtl => "这台中继用的是新的控制协议，你这份模组连不上：换最新版模组",
+                RelayError.Old => "房主的模组是 " + peer + "，你这版是 v" + ProtocolVersion.Current
+                                  + "：把模组升到同一版本才能联机",
+                RelayError.New => "房主的模组是 " + peer + "，比你这版 v" + ProtocolVersion.Current
+                                  + " 旧：让他升到与你相同的版本",
                 _ => "中继返回错误：" + reason,
             };
-            ModEnv.Log("中继错误 " + reason);
+            ModEnv.Log("中继错误 " + reason + (detail.Length > 0 ? " " + detail : ""));
             _pendingJoinCode = "";
             if (_relayHostSide && _relayCode.Length == 0)
             {
                 // 建房这一步已经拿到应答（哪怕是拒绝）：不能再让超时看门狗报"没应答"，那是假话
                 _relayHostSide = false;
-                if (reason == "full")
+                if (reason == RelayError.Full)
                 {
                     Net.Shutdown();
                     Phase = SessionPhase.Idle;

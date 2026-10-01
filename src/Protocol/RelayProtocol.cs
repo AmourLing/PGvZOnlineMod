@@ -15,6 +15,25 @@ namespace PGvZOnlineMod.Protocol
         public bool Locked;
     }
 
+    /// <summary>ERR 的原因码；模组端按这个翻成中文，不要再猜。</summary>
+    public static class RelayError
+    {
+        public const string Passwd = "passwd";
+        public const string NoReady = "noready";
+        public const string Full = "full";
+        public const string NoPerm = "noperm";
+        /// <summary>控制协议过旧：这台中继已按新字段布局升级，旧模组连不上。</summary>
+        public const string OldCtl = "oldctl";
+        /// <summary>房主的游戏协议比本端新（Detail 带房主的版本号）。</summary>
+        public const string Old = "old";
+        /// <summary>房主的游戏协议比本端旧（Detail 带房主的版本号）。</summary>
+        public const string New = "new";
+        /// <summary>没带有效令牌：LIST 的应答比请求大几十倍，不发令牌就不给列表。</summary>
+        public const string Token = "token";
+        /// <summary>密码错得太频繁，暂时不再应答。</summary>
+        public const string Slow = "slow";
+    }
+
     public enum RelayKind
     {
         Unknown = 0,
@@ -41,13 +60,23 @@ namespace PGvZOnlineMod.Protocol
         public string Name;
         public string Password;
         public string Error;
+        /// <summary>ERR 附带的信息（目前只有 old/new 带的那一对游戏协议版本号）。</summary>
+        public string Detail;
         public int GuestPort;
         public int HostPort;
         public int LevelIndex;
         public int Players;
         public int MaxPlayers;
-        /// <summary>ROOMS 应答里声明的房间数（以实际解出的条目为准做上限校验用）。</summary>
+        /// <summary>报文尾部声明的控制协议版本；旧端不带，解出来是 0。</summary>
+        public int Ctl;
+        /// <summary>HOST/JOIN 声明的游戏协议版本（0 = 没声明）。</summary>
+        public int GameVersion;
+        /// <summary>LIST 带上来、PONG 发下去的那个一次性令牌。</summary>
+        public string Token;
+        /// <summary>ROOMS 应答里声明的房间数 / PONG 里声明的当前房间数。</summary>
         public int Count;
+        /// <summary>PONG 里声明的房间容量。</summary>
+        public int Capacity;
         public List<RelayRoomInfo> Rooms;
     }
 
@@ -57,12 +86,31 @@ namespace PGvZOnlineMod.Protocol
     /// 用 `|` 分字段、`,` 分房间记录，两端一律经 Clean() 过滤，所以名字里不会出现分隔符。
     /// 文本协议是刻意选的：出问题时用 nc/socat 手敲一行就能验，不必为了调试再写一个客户端。
     /// 这份定义由模组与 RelayServer 共用（服务端直接链入本文件），保证两端不会各写一套而写串。
+    ///
+    /// v2 加了尾部字段：控制协议版本、游戏协议版本、LIST 用的一次性令牌。
+    /// **新字段一律追加在尾部**——旧服务端解析 HOST 取的是第 1、2 字段，版本号放前面的话
+    /// 它会把版本数字当成房名，静默建出一个名叫 "2" 的房间，比直接拒绝坏得多。
     /// </summary>
     public static class RelayProtocol
     {
         public const int DefaultControlPort = 27270;
         public const char Sep = '|';
         public const char RecSep = ',';
+
+        /// <summary>
+        /// 控制协议的字段布局版本。服务端见到不带它的 HOST/LIST 一律拒绝，
+        /// 因为字段含义不同的两端互相猜是没结果的。
+        /// </summary>
+        public const int Version = 2;
+
+        /// <summary>LIST 令牌的有效期（秒）：客户端每 5 秒 PING 一次续期，2 秒 LIST 一次用掉。</summary>
+        public const int TokenTtlSeconds = 90;
+
+        /// <summary>同一来源允许连续输错房间密码的次数，超过就暂时不再应答。</summary>
+        public const int MaxPasswdFails = 5;
+
+        /// <summary>密码错误的计数窗口（秒）。</summary>
+        public const int PasswdWindowSeconds = 30;
 
         /// <summary>主机侧隧道的登记/保活报文前缀（空格分隔，不带自由文本，所以不走 Sep）。</summary>
         public const string TunnelPrefix = "PGVZREG ";
@@ -92,8 +140,12 @@ namespace PGvZOnlineMod.Protocol
 
         // ------------------------------------------------------------ 组包（请求）
 
-        public static string BuildHost(string name, string password)
-            => "HOST" + Sep + Clean(name) + Sep + Clean(password);
+        /// <summary>
+        /// 建房。尾部的 gameVersion 是**本端的游戏协议版本**（调用方从 ProtocolVersion.Current 传进来）：
+        /// 中继自己不写死这个数，所以游戏协议升到 v19 时只重发模组，服务端不用动。
+        /// </summary>
+        public static string BuildHost(string name, string password, int gameVersion)
+            => "HOST" + Sep + Clean(name) + Sep + Clean(password) + Sep + N(Version) + Sep + N(gameVersion);
 
         /// <summary>主机保活并上报房间当前状态（关卡、人数）。中继靠它判断房间还活着。</summary>
         public static string BuildSeen(string code, int levelIndex, int players, int maxPlayers, string password)
@@ -101,14 +153,17 @@ namespace PGvZOnlineMod.Protocol
                + Sep + N(players) + Sep + N(maxPlayers)
                + Sep + Clean(password);
 
-        public static string BuildJoin(string code, string password)
-            => "JOIN" + Sep + Clean(code) + Sep + Clean(password);
+        /// <summary>加入。gameVersion 与 HOST 同一个来源，服务端拿它跟房主上报的那一份比对。</summary>
+        public static string BuildJoin(string code, string password, int gameVersion)
+            => "JOIN" + Sep + Clean(code) + Sep + Clean(password) + Sep + N(Version) + Sep + N(gameVersion);
 
-        public static string BuildList() => "LIST";
+        /// <summary>要房间列表。token 来自上一次 PONG；不带或过期都会被回 ERR|token。</summary>
+        public static string BuildList(string token)
+            => "LIST" + Sep + (token ?? "");
 
         public static string BuildDrop(string code) => "DROP" + Sep + Clean(code);
 
-        public static string BuildPing() => "PING";
+        public static string BuildPing() => "PING" + Sep + N(Version);
 
         /// <summary>主机侧隧道的登记报文（同时充当 NAT 保活）。</summary>
         public static string BuildTunnelRegister(string code, int slot)
@@ -121,9 +176,17 @@ namespace PGvZOnlineMod.Protocol
 
         public static string BuildOk(int guestPort) => "OK" + Sep + N(guestPort);
 
-        public static string BuildPong() => "PONG";
+        /// <summary>
+        /// PING 的应答：顺带发令牌，并把"这台机现在几个房、能装几个"透给客户端
+        /// ——左列那行 "32ms · 3/15 房" 就是这一句的账。
+        /// </summary>
+        public static string BuildPong(string token, int rooms, int capacity)
+            => "PONG" + Sep + N(Version) + Sep + (token ?? "") + Sep + N(rooms) + Sep + N(capacity);
 
-        public static string BuildError(string reason) => "ERR" + Sep + Clean(reason);
+        public static string BuildError(string reason, string detail = "")
+            => detail.Length > 0
+                ? "ERR" + Sep + Clean(reason) + Sep + Clean(detail)
+                : "ERR" + Sep + Clean(reason);
 
         public static string BuildRooms(IList<RelayRoomInfo> rooms)
         {
@@ -166,6 +229,8 @@ namespace PGvZOnlineMod.Protocol
                     msg.Kind = RelayKind.Host;
                     msg.Name = Field(p, 1);
                     msg.Password = Field(p, 2);
+                    msg.Ctl = Num(Field(p, 3));
+                    msg.GameVersion = Num(Field(p, 4));
                     return msg;
                 case "SEEN":
                     if (p.Length < 5)
@@ -187,9 +252,12 @@ namespace PGvZOnlineMod.Protocol
                     msg.Kind = RelayKind.Join;
                     msg.Code = Field(p, 1);
                     msg.Password = Field(p, 2);
+                    msg.Ctl = Num(Field(p, 3));
+                    msg.GameVersion = Num(Field(p, 4));
                     return msg;
                 case "LIST":
                     msg.Kind = RelayKind.List;
+                    msg.Token = Field(p, 1);
                     return msg;
                 case "DROP":
                     msg.Kind = RelayKind.Drop;
@@ -197,6 +265,7 @@ namespace PGvZOnlineMod.Protocol
                     return msg;
                 case "PING":
                     msg.Kind = RelayKind.Ping;
+                    msg.Ctl = Num(Field(p, 1));
                     return msg;
                 case "ROOM":
                     if (p.Length < 4)
@@ -214,10 +283,15 @@ namespace PGvZOnlineMod.Protocol
                     return msg;
                 case "PONG":
                     msg.Kind = RelayKind.Pong;
+                    msg.Ctl = Num(Field(p, 1));
+                    msg.Token = Field(p, 2);
+                    msg.Count = Num(Field(p, 3));
+                    msg.Capacity = Num(Field(p, 4));
                     return msg;
                 case "ERR":
                     msg.Kind = RelayKind.Err;
                     msg.Error = Field(p, 1);
+                    msg.Detail = Field(p, 2);
                     return msg;
                 case "ROOMS":
                 {
