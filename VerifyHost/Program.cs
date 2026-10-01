@@ -53,6 +53,7 @@ namespace PGvZOnlineVerify
             TestRelayProtocol();
             TestIdentity();
             TestDefaultRelaySeed();
+            TestLobbyGeometry();
             TestRelayEndToEnd();
             TestRelaySession();
             TestRelayLateReply();
@@ -1189,6 +1190,74 @@ namespace PGvZOnlineVerify
                 }
             }
             return null;
+        }
+
+        // ------------------------------------------------------------ 5c. 浏览页布局不重叠
+
+        /// <summary>
+        /// 把整页尺寸抽成 LobbyGeom 之后，"重叠"这件事第一次可以被自动查：
+        /// 实机来回报过两次（副文字压在下一行上、说明文字压在房间行上），
+        /// 那种事离线门以前完全看不见。这里只算矩形，不抄 UI 里的字面量——
+        /// 数值全部取自同一个 LobbyGeom，改坏任何一处间距都会立刻相交。
+        /// </summary>
+        private static void TestLobbyGeometry()
+        {
+            Console.WriteLine("-- 浏览页布局 --");
+            var sizes = new (int w, int h, int bw, int bh)[]
+            {
+                (800, 600, 130, 40),      // 4:3 基准
+                (1066, 600, 150, 44),     // 16:9（他截图那台）
+                (1280, 720, 150, 44),
+                (640, 480, 130, 40),      // 极限小：兜底分支要走得到
+            };
+            var bad = new List<string>();
+
+            void Want(bool ok, string what, string detail)
+            {
+                if (!ok)
+                {
+                    bad.Add(what + "（" + detail + "）");
+                }
+            }
+
+            foreach (var (w, h, bw, bh) in sizes)
+            {
+                                var g = PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.Compute(w, h, bw, bh);
+                string at = w + "x" + h;
+
+                Want(g.ServerRowsBottom + 2 <= g.DelButton, "左列画满 10 行压到删除按钮",
+                    at + " 行底=" + g.ServerRowsBottom + " 按钮顶=" + g.DelButton);
+                Want(g.DelButton + bh + 2 <= g.AddButton, "删除/添加两个按钮叠在一起",
+                    at + " 删=" + g.DelButton + " 加=" + g.AddButton);
+                Want(g.AddButton + bh <= g.PanelBottom - 2, "添加按钮掉出面板外",
+                    at + " 底=" + (g.AddButton + bh) + " 面板底=" + g.PanelBottom);
+                Want(g.RelayRowsBottom + 2 <= g.Notice, "中继说明压在房间行/房号行上",
+                    at + " 行底=" + g.RelayRowsBottom + " 说明顶=" + g.Notice);
+                Want(g.NoticeBottom + 2 <= g.ButtonRow, "中继说明压到创建房间/刷新那一排",
+                    at + " 说明底=" + g.NoticeBottom + " 按钮顶=" + g.ButtonRow);
+                Want(g.RelayRowsBottom + 2 <= g.ButtonRow, "局域网房间行压到按钮排",
+                    at + " 行底=" + g.RelayRowsBottom + " 按钮顶=" + g.ButtonRow);
+                Want(g.ServerRowsFit >= 3 && g.RoomRowsFit >= 2,
+                    "窗口矮到一行都放不下（该退没退）",
+                    at + " 服务器行=" + g.ServerRowsFit + " 房间行=" + g.RoomRowsFit);
+                Want(PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.HeaderY + 14
+                     <= PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.PanelTitleY,
+                    "顶部“发现 N 个房间”压到面板标题",
+                    at + " 头=" + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.HeaderY + " 标题=" + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.PanelTitleY);
+                Want(PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.PanelTitleY + 18 <= g.ListTop, "面板标题压到第一行",
+                    at + " 标题=" + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.PanelTitleY + " 首行=" + g.ListTop);
+                Want(g.NickY + 12 <= h && g.NickY > g.PanelBottom, "昵称那行被切掉或压在面板上",
+                    at + " 昵称=" + g.NickY + " 面板底=" + g.PanelBottom);
+                Want(g.PanelBottom + 10 + bh + 2 <= h, "返回按钮掉出画面外",
+                    at + " 返回底=" + (g.PanelBottom + 10 + bh));
+                Want(g.RightX + g.RightW <= g.X0 + g.Cw + 1 && g.RightW >= 160, "右列超出内容区",
+                    at + " 右列=" + g.RightX + "+" + g.RightW);
+                Want(g.DropX >= 0 && g.DropX + g.DropW <= w && g.DropY + PGvZOnlineMod.Ui.OnlineLobbyScreen.LobbyGeom.DropH <= h,
+                    "选关下拉超出画面", at + " 下拉=" + g.DropX + "," + g.DropY + " 宽=" + g.DropW);
+            }
+
+            Check("浏览页布局：各分辨率下互不重叠（" + sizes.Length + " 档 × 12 条）",
+                bad.Count == 0, bad.Count == 0 ? "" : string.Join(" ; ", bad.Take(6)));
         }
 
         // ------------------------------------------------------------ 6. 中继端到端（起真中继进程 + 真 Lidgren）

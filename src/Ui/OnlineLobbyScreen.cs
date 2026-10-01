@@ -48,9 +48,9 @@ namespace PGvZOnlineMod.Ui
         private const int LvlNextId = 171;
         private const int RoomRowIdBase = 180;      // 180..187 房间列表行
         private const int ServerRowIdBase = 190;    // 190..199 服务器行
-        private const int RemoveServerIdBase = 220; // 220..229 服务器行右侧的"去掉这台"
         private const int ManualRowId = 240;
         private const int PwToggleId = 241;
+        private const int DelServerId = 243;
         private const int CodeRowId = 242;
         private const int RelayRoomIdBase = 250;  // 250..257 中继列表里的房间行
         internal const int TabCount = 6;            // 全部 + 五个页签（离线回归会拿它当分类数的上限校验）
@@ -89,6 +89,7 @@ namespace PGvZOnlineMod.Ui
         private readonly LawnApp _app;
         private NewLawnButton _backButton;
         private NewLawnButton _addServerBtn;
+        private NewLawnButton _delServerBtn;
         private NewLawnButton _createBtn;
         private NewLawnButton _refreshBtn;
         private NewLawnButton _levelBtn;
@@ -135,6 +136,91 @@ namespace PGvZOnlineMod.Ui
         private int _leftW = 200;
         private int _rightX = 234;
         private int _rightW = 546;
+        private LobbyGeom _geom;
+
+        /// <summary>
+        /// 浏览页的全部尺寸。**单独抽出来是为了离线门能直接把布局算一遍**——
+        /// 重叠这类事在测试里看不见，实机来回报了两次（副文字压行、说明压房间行），
+        /// 抽出来之后任何一处改动只要让矩形相交，回归就红，不必再靠眼睛。
+        /// 数值只有这一份：用例不许另抄一遍字面量。
+        /// </summary>
+        internal struct LobbyGeom
+        {
+            public int W, H, X0, Cw, PanelTop, PanelBottom, LeftW, RightX, RightW, BtnW, BtnH;
+
+            // 行距/行高/一屏行数：只有这里一份
+            public const int ServerPitch = 33;
+            public const int ServerRowH = 25;
+            public const int MaxServerRows = 10;      // 局域网 + 8 台中继 + 手动一行
+            public const int RoomPitch = 44;
+            public const int RoomRowH = 38;
+            public const int MaxRoomRows = 7;         // 右列一屏最多几行（含"用房间号加入"）
+            public const int DropH = 178;
+            public const int HeaderY = 42;
+            public const int PanelTitleY = PanelTopConst + 8;
+            private const int PanelTopConst = 64;
+
+            public static LobbyGeom Compute(int w, int h, int btnW, int btnH)
+            {
+                var g = new LobbyGeom { W = w, H = h, BtnW = btnW, BtnH = btnH };
+                g.Cw = Math.Min(w - 32, 760);
+                g.X0 = (w - g.Cw) / 2;
+                if (g.X0 < 8)
+                {
+                    g.X0 = 8;
+                }
+                g.PanelTop = PanelTopConst;
+                g.PanelBottom = h - 74;
+                if (g.PanelBottom < g.PanelTop + 240)
+                {
+                    g.PanelBottom = g.PanelTop + 240;
+                }
+                g.LeftW = 200;
+                g.RightX = g.X0 + g.LeftW + 14;
+                g.RightW = g.X0 + g.Cw - g.RightX;
+                if (g.RightW < 220)
+                {
+                    g.RightW = Math.Max(160, w - g.RightX - 8);
+                }
+                return g;
+            }
+
+            public int ListTop => PanelTop + 30;
+            public int ButtonRow => PanelBottom - BtnH - 8;
+            public int AddButton => PanelBottom - BtnH - 6;
+            public int DelButton => AddButton - BtnH - 4;
+            public int Notice => ButtonRow - 66;
+            public int DropX => X0 + 8;
+            public int DropY => PanelTop + 26;
+            public int DropW => Cw - 16;
+
+            /// <summary>能塞下几行服务器：窗口矮就少画几行，而不是叠到按钮上。</summary>
+            public int ServerRowsFit => Fit(DelButton - 4, ServerPitch, ServerRowH, MaxServerRows, 3);
+
+            /// <summary>右列能塞下几行房间（中继态还要给"用房间号加入"留一行）。</summary>
+            public int RoomRowsFit => Fit(Notice - 4, RoomPitch, RoomRowH, MaxRoomRows, 2);
+
+            /// <summary>
+            /// 装得下几行：最后一行的**下沿**（不是顶边）必须不超过 bottom，
+            /// 所以是 (bottom - 首行顶 - 行高)/行距 + 1；只按行距除会多算一行（640x480 那档就是这么差 1px）。
+            /// </summary>
+            private int Fit(int bottom, int pitch, int rowH, int cap, int min)
+            {
+                int n = (bottom - ListTop - rowH) / pitch + 1;
+                if (n > cap)
+                {
+                    n = cap;
+                }
+                return n < min ? min : n;
+            }
+
+            /// <summary>左列实际画出来的最后一行的下沿。</summary>
+            public int ServerRowsBottom => ListTop + (ServerRowsFit - 1) * ServerPitch + ServerRowH;
+            /// <summary>右列实际画出来的最后一行（含"用房间号加入"那行）的下沿。</summary>
+            public int RelayRowsBottom => ListTop + (RoomRowsFit - 1) * RoomPitch + RoomRowH;
+            public int NoticeBottom => Notice + 36 + 12;
+            public int NickY => H - 26;
+        }
 
         public static bool ScreenOpen => _inst != null;
 
@@ -280,6 +366,8 @@ namespace PGvZOnlineMod.Ui
 
             _backButton = MakeButton(BackId, "[BACK_TO_MENU]");
             _addServerBtn = MakeButton(AddServerId, "添加服务器");
+            _delServerBtn = MakeButton(DelServerId, "删除服务器");
+            _delServerBtn.mVisible = false;
             _createBtn = MakeButton(CreateRoomId, "创建房间");
             _refreshBtn = MakeButton(RefreshId, "刷新");
 
@@ -324,38 +412,38 @@ namespace PGvZOnlineMod.Ui
 
         private void ComputeLayout()
         {
-            int w = mWidth, h = mHeight;
-            _cw = Math.Min(w - 32, 760);
-            _x0 = (w - _cw) / 2;
-            if (_x0 < 8)
-            {
-                _x0 = 8;
-            }
-            _panelTop = 64;
-            _panelBottom = h - 74;
-            if (_panelBottom < _panelTop + 240)
-            {
-                _panelBottom = _panelTop + 240;
-            }
-            _leftW = 200;
-            _rightX = _x0 + _leftW + 14;
-            _rightW = _x0 + _cw - _rightX;
-            if (_rightW < 220)
-            {
-                _rightW = Math.Max(160, w - _rightX - 8);
-            }
+            _geom = LobbyGeom.Compute(mWidth, mHeight, BtnW, BtnH);
+            _x0 = _geom.X0;
+            _cw = _geom.Cw;
+            _panelTop = _geom.PanelTop;
+            _panelBottom = _geom.PanelBottom;
+            _leftW = _geom.LeftW;
+            _rightX = _geom.RightX;
+            _rightW = _geom.RightW;
         }
 
-        private int ButtonRowY => _panelBottom - BtnH - 8;
-        private int ListTopY => _panelTop + 30;
-        private int FooterY => ButtonRowY - 20;
+        private int ButtonRowY => _geom.ButtonRow;
+        private int AddButtonY => _geom.AddButton;
+        private int ListTopY => _geom.ListTop;
+        private int NoticeY => _geom.Notice;
+        private int DelButtonY => _geom.DelButton;
+        private int ServerRowsBottom => _geom.ServerRowsBottom;
+        private int RelayRowsBottom => _geom.RelayRowsBottom;
+
+        // 选关下拉是整页级的覆盖层，几何跟着布局走（写死 158 起会在宽屏上压到左列）
+        private int DropX => _geom.DropX;
+        private int DropY => _geom.DropY;
+        private int DropW => _geom.DropW;
+        private int DropH => LobbyGeom.DropH;
 
         /// <summary>把真按钮摆到布局上；分辨率变了（宽屏切换）要重算一遍。</summary>
         private void ApplyLayout()
         {
             int bw = BtnW, bh = BtnH;
             _backButton.Resize(_x0, _panelBottom + 10, bw, bh);
-            _addServerBtn.Resize(_x0 + (_leftW - bw) / 2, ButtonRowY, bw, bh);
+            // 左列两个按钮叠着放：删除在上、添加在下（× 画在服务器行上太容易误触）
+            _addServerBtn.Resize(_x0 + (_leftW - bw) / 2, AddButtonY, bw, bh);
+            _delServerBtn.Resize(_x0 + (_leftW - bw) / 2, DelButtonY, bw, bh);
             _createBtn.Resize(_rightX + _rightW / 2 - bw - 5, ButtonRowY, bw, bh);
             _refreshBtn.Resize(_rightX + _rightW / 2 + 5, ButtonRowY, bw, bh);
 
@@ -486,13 +574,17 @@ namespace PGvZOnlineMod.Ui
             _addServerBtn.mVisible = !room;
             _createBtn.mVisible = !room && !SelectedIsManual;
             _refreshBtn.mVisible = !room;
+            // 删除只对"玩家自己加的中继"有意义，且只在选中它时出现（不再画 × 在行上误触）
+            _delServerBtn.mVisible = !room && SelectedIsRelay;
             // 离开房间只在房间内出现：这里漏设过一次，浏览页中间就杵着一个"离开房间"
             _disconnectBtn.mVisible = room;
 
             bool canPick = room && host && connected;
-            if (!canPick)
+            if (!canPick && !_dropFromDialog)
             {
                 _dropOpen = false; // 否则[选关]按钮隐掉了，展开的下拉关不上
+                // 但"创建房间"对话框里点开的下拉不属于这条：那时还没建房（room=false），
+                // 一并关掉会让对话框直接消失，表现就是"点[选择关卡]没反应"
             }
             _levelBtn.mVisible = canPick;
             _startBtn.mVisible = room && host;
@@ -538,35 +630,21 @@ namespace PGvZOnlineMod.Ui
         /// <summary>浏览页：左列服务器行 + 右列房间行。</summary>
         private void BuildBrowseHits()
         {
-            for (int i = 0; i < _serverRows.Count && i < ServerRowMax; i++)
+            for (int i = 0; i < _serverRows.Count && i < _geom.ServerRowsFit; i++)
             {
                 var r = _serverRows[i];
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.ServerRow,
                     X = _x0 + 10,
-                    Y = ListTopY + i * 34,
+                    Y = ListTopY + i * LobbyGeom.ServerPitch,
                     W = _leftW - 20,
-                    H = 26,
+                    H = LobbyGeom.ServerRowH,
                     Id = r.IsManual ? ManualRowId : ServerRowIdBase + i,
                     Main = Clip(r.Label, 11),
                     Right = r.Sub,
                     Selected = i == _sel,
                 });
-                // 只有玩家自己加的中继能删；行选中时才露出"×"，平时不占视觉
-                if (r.Entry != null && i == _sel)
-                {
-                    _hits.Add(new Hit
-                    {
-                        Kind = HitKind.Small,
-                        X = _x0 + _leftW - 30,
-                        Y = ListTopY + i * 34 + 2,
-                        W = 22,
-                        H = 22,
-                        Id = RemoveServerIdBase + i,
-                        Main = "×",
-                    });
-                }
             }
 
             if (SelectedIsManual)
@@ -576,7 +654,11 @@ namespace PGvZOnlineMod.Ui
             if (SelectedIsRelay)
             {
                 var rooms = Sync.Session.RelayRooms;
-                for (int i = 0; i < RoomRowMax - 1 && i < rooms.Count; i++)
+                // 一屏最多 6 个房 + 1 行"用房间号加入"，再往下是说明与按钮排：
+                // 行数不封顶的话说明会压到房间行上（实机截图第二次反馈的就是这个）
+                // 留一行给"用房间号加入"：窗口矮时少列几个房，也不许叠上去
+                int shown = Math.Min(rooms.Count, System.Math.Max(1, _geom.RoomRowsFit - 1));
+                for (int i = 0; i < shown; i++)
                 {
                     var r = rooms[i];
                     string lvl = r.LevelIndex >= 0
@@ -586,9 +668,9 @@ namespace PGvZOnlineMod.Ui
                     {
                         Kind = HitKind.RoomRow,
                         X = _rightX + 10,
-                        Y = ListTopY + i * 44,
+                        Y = ListTopY + i * LobbyGeom.RoomPitch,
                         W = _rightW - 20,
-                        H = 38,
+                        H = LobbyGeom.RoomRowH,
                         Id = RelayRoomIdBase + i,
                         Main = Clip("房间：" + r.RoomName + "的房间   关卡：" + lvl + "   "
                                    + r.Players + "/" + r.MaxPlayers + (r.Locked ? "   #密码" : ""), 28),
@@ -600,7 +682,7 @@ namespace PGvZOnlineMod.Ui
                 {
                     Kind = HitKind.RoomRow,
                     X = _rightX + 10,
-                    Y = ListTopY + Math.Min(rooms.Count, RoomRowMax - 1) * 44,
+                    Y = ListTopY + shown * LobbyGeom.RoomPitch,
                     W = _rightW - 20,
                     H = 38,
                     Id = CodeRowId,
@@ -609,16 +691,16 @@ namespace PGvZOnlineMod.Ui
                 return;
             }
             int n = Sync.Session.RoomList.Count;
-            for (int i = 0; i < RoomRowMax && i < n; i++)
+            for (int i = 0; i < _geom.RoomRowsFit && i < n; i++)
             {
                 var room = Sync.Session.RoomList[i];
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.RoomRow,
                     X = _rightX + 10,
-                    Y = ListTopY + i * 44,
+                    Y = ListTopY + i * LobbyGeom.RoomPitch,
                     W = _rightW - 20,
-                    H = 38,
+                    H = LobbyGeom.RoomRowH,
                     Id = RoomRowIdBase + i,
                     Main = Clip(room.DisplayText, 28),
                     Right = room.Ip + ":" + room.Port,
@@ -799,8 +881,8 @@ namespace PGvZOnlineMod.Ui
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.Tab,
-                    X = 166 + i * 78,
-                    Y = 56,
+                    X = DropX + 8 + i * 78,
+                    Y = DropY + 6,
                     W = 74,
                     H = 22,
                     Id = LvlPageIdBase + i,
@@ -819,9 +901,9 @@ namespace PGvZOnlineMod.Ui
                 _hits.Add(new Hit
                 {
                     Kind = HitKind.LevelRow,
-                    X = 166,
-                    Y = 84 + i * 28,
-                    W = 468,
+                    X = DropX + 8,
+                    Y = DropY + 34 + i * 28,
+                    W = DropW - 16,
                     H = 26,
                     Id = LvlRowIdBase + i,
                     Main = Clip(Sync.Session.Levels[li].Name, 26),
@@ -832,12 +914,12 @@ namespace PGvZOnlineMod.Ui
             {
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Pager, X = 166, Y = 200, W = 86, H = 22,
+                    Kind = HitKind.Pager, X = DropX + 8, Y = DropY + 150, W = 86, H = 22,
                     Id = LvlPrevId, Main = "< 上一页",
                 });
                 _hits.Add(new Hit
                 {
-                    Kind = HitKind.Pager, X = 258, Y = 200, W = 86, H = 22,
+                    Kind = HitKind.Pager, X = DropX + 100, Y = DropY + 150, W = 86, H = 22,
                     Id = LvlNextId, Main = "下一页 >",
                 });
             }
@@ -1105,12 +1187,12 @@ namespace PGvZOnlineMod.Ui
         {
             // 下拉面板底：盖住它下面的内容（经典下拉行为），条目随后由 DrawHits 画在上面
             g.SetColor(new SexyColor(24, 28, 20, 246));
-            g.FillRect(158, 50, 484, 178);
+            g.FillRect(DropX, DropY, DropW, DropH);
             g.SetColor(new SexyColor(170, 220, 150, 220));
-            g.DrawRect(158, 50, 484, 178);
+            g.DrawRect(DropX, DropY, DropW, DropH);
             Text(g, "第 " + (_dropPage + 1) + "/" + _dropPages + " 页 · 共 " + _dropIndices.Count + " 关",
-                352, 206, Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
-            Text(g, "点一条即选定", 626, 206, Resources.FONT_BRIANNETOD12,
+                DropX + 8, DropY + 156, Resources.FONT_BRIANNETOD12, new SexyColor(180, 190, 180));
+            Text(g, "点一条即选定", DropX + DropW - 8, DropY + 156, Resources.FONT_BRIANNETOD12,
                 new SexyColor(150, 160, 150), DrawStringJustification.Right);
         }
 
@@ -1118,14 +1200,14 @@ namespace PGvZOnlineMod.Ui
         {
             Panel(g, _x0, _panelTop, _leftW, _panelBottom - _panelTop);
             Panel(g, _rightX, _panelTop, _rightW, _panelBottom - _panelTop);
-            Text(g, "服务器", _x0 + _leftW / 2, _panelTop + 8, Resources.FONT_DWARVENTODCRAFT15,
+            Text(g, "服务器", _x0 + _leftW / 2, LobbyGeom.PanelTitleY, Resources.FONT_DWARVENTODCRAFT15,
                 new SexyColor(255, 244, 200), DrawStringJustification.Center);
-            Text(g, "房间列表", _rightX + _rightW / 2, _panelTop + 8, Resources.FONT_DWARVENTODCRAFT15,
+            Text(g, "房间列表", _rightX + _rightW / 2, LobbyGeom.PanelTitleY, Resources.FONT_DWARVENTODCRAFT15,
                 new SexyColor(255, 244, 200), DrawStringJustification.Center);
 
             int rooms = Sync.Session.RoomList.Count;
             Text(g, SelectedIsLan ? "发现 " + rooms + " 个房间" : "选择左边的服务器",
-                mWidth / 2, 42, Resources.FONT_BRIANNETOD16, new SexyColor(235, 235, 225),
+                mWidth / 2, LobbyGeom.HeaderY, Resources.FONT_BRIANNETOD16, new SexyColor(235, 235, 225),
                 DrawStringJustification.Center);
 
             if (SelectedIsLan)
@@ -1146,25 +1228,22 @@ namespace PGvZOnlineMod.Ui
             }
             else
             {
+                // 中继那几行说明统一压到面板底部：右列上面是房间行 + "用房间号加入…"行，
+                // 说明写在行中间就会叠上去（实机截图第二次反馈的就是这个）
                 var r = SelectedRow;
                 Text(g, "已选中继：" + r.Label + "（" + r.Sub + "）",
-                    _rightX + 14, ListTopY + 10, Resources.FONT_BRIANNETOD16, new SexyColor(255, 244, 200));
+                    _rightX + 14, NoticeY, Resources.FONT_BRIANNETOD12, new SexyColor(255, 244, 200));
                 int rn = Sync.Session.RelayRooms.Count;
                 Text(g, rn == 0
-                    ? "这台服务器上暂时没有等待中的房间；[刷新] 再问一次，或点下面那行填房间号。"
+                    ? "这台服务器上暂时没有等待中的房间；[刷新] 再问一次。"
                     : "发现 " + rn + " 个房间（点一行加入，要密码的会问你密码）。",
-                    _rightX + 14, ListTopY + 34, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
+                    _rightX + 14, NoticeY + 18, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
                 Text(g, "这条不依赖同一网段：双方各自出网到这台服务器即可。",
-                    _rightX + 14, ListTopY + 52, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
+                    _rightX + 14, NoticeY + 36, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
             }
 
-            // 选中那行的副文字放在面板页脚，不挤在行与行之间
-            var sel = SelectedRow;
-            Text(g, Clip(sel.Label + " — " + sel.Sub, 24), _x0 + 8, FooterY,
-                Resources.FONT_BRIANNETOD12, new SexyColor(255, 244, 200));
-
             Text(g, "你的昵称：" + Sync.Session.LocalNick() + "（取游戏存档里的名字）",
-                mWidth / 2, mHeight - 22, Resources.FONT_BRIANNETOD12,
+                mWidth / 2, _geom.NickY, Resources.FONT_BRIANNETOD12,
                 new SexyColor(170, 180, 170), DrawStringJustification.Center);
         }
 
@@ -1574,9 +1653,9 @@ namespace PGvZOnlineMod.Ui
                 _pwOn = !_pwOn;
                 return;
             }
-            if (theId >= RemoveServerIdBase && theId < RemoveServerIdBase + ServerRowMax)
+            if (theId == DelServerId)
             {
-                RemoveServer(theId - RemoveServerIdBase);
+                RemoveServer(_sel);
                 return;
             }
             if (theId == CodeRowId)
@@ -1665,6 +1744,7 @@ namespace PGvZOnlineMod.Ui
         {
             RemoveWidget(_backButton);
             RemoveWidget(_addServerBtn);
+            RemoveWidget(_delServerBtn);
             RemoveWidget(_createBtn);
             RemoveWidget(_refreshBtn);
             RemoveWidget(_levelBtn);
