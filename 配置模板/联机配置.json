@@ -5,5 +5,11 @@
   "SnapshotHz": 20,
   "CursorHz": 10,
   "ZombieHpPerExtraPlayer": 0.35,
-  "Servers": []
+  "Servers": [
+    {
+      "Name": "自家中继（上海）",
+      "Host": "47.116.78.238",
+      "Port": 27270
+    }
+  ]
 }

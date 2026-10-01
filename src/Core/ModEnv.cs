@@ -57,6 +57,11 @@ namespace PGvZOnlineMod.Core
         private static readonly int _pid = Process.GetCurrentProcess().Id;
         private const int MaxLogFiles = 20;
 
+        /// <summary>作者自建的中继（阿里云上海）。装上就在联机页左列能直接选中，不必先手填。</summary>
+        public const string DefaultRelayName = "自家中继（上海）";
+        public const string DefaultRelayHost = "47.116.78.238";
+        public const int DefaultRelayPort = 27270;
+
         /// <summary>每次启动生成新日志文件：Logs/联机_时间_P进程.log（自动清理，仅保留最近 20 个）。</summary>
         private static string ResolveLogPath()
         {
@@ -109,12 +114,14 @@ namespace PGvZOnlineMod.Core
             }
             string path = Path.Combine(DataDir, "联机配置.json");
             bool existed = false;
+            string raw = null;
             try
             {
                 if (File.Exists(path))
                 {
                     existed = true;
-                    _config = JsonConvert.DeserializeObject<OnlineConfig>(File.ReadAllText(path));
+                    raw = File.ReadAllText(path);
+                    _config = JsonConvert.DeserializeObject<OnlineConfig>(raw);
                 }
             }
             catch (Exception ex)
@@ -168,7 +175,20 @@ namespace PGvZOnlineMod.Core
             {
                 _config.ZombieHpPerExtraPlayer = 0.35f;
             }
-            if (!existed)
+            // 默认中继：作者自己那台服务器，装上就能选中它跨互联网玩，不必先手填。
+            // 只在"这份配置里压根没有 Servers 这一项"时补（老配置、或首次生成的默认配置）；
+            // 有这一项但为空，是玩家自己删空的，尊重他，不再塞回去。
+            bool seeded = false;
+            bool hadServersKey = raw != null && raw.Contains("\"Servers\"");
+            if (!hadServersKey && _config.Servers.Count == 0)
+            {
+                _config.Servers.Add(new ServerEntry
+                {
+                    Name = DefaultRelayName, Host = DefaultRelayHost, Port = DefaultRelayPort,
+                });
+                seeded = true;
+            }
+            if (!existed || seeded)
             {
                 // 首次运行自动落一份默认配置，玩家不用先进一次联机才能找到文件
                 SaveConfig();

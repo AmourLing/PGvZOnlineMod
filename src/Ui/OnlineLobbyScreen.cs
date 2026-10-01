@@ -130,7 +130,7 @@ namespace PGvZOnlineMod.Ui
         // 浏览页几何（分辨率变了重算，见 ComputeLayout）
         private int _x0 = 20;
         private int _cw = 760;
-        private int _panelTop = 58;
+        private int _panelTop = 64;
         private int _panelBottom = 526;
         private int _leftW = 200;
         private int _rightX = 234;
@@ -301,6 +301,7 @@ namespace PGvZOnlineMod.Ui
             _startBtn = MakeButton(StartId, "开始游戏");
             _readyBtn = MakeButton(ReadyBtnId, "准备");
             _disconnectBtn = MakeButton(DisconnectId, "离开房间");
+            _disconnectBtn.mVisible = false;
 
             ComputeLayout();
             ApplyLayout();
@@ -330,7 +331,7 @@ namespace PGvZOnlineMod.Ui
             {
                 _x0 = 8;
             }
-            _panelTop = 58;
+            _panelTop = 64;
             _panelBottom = h - 74;
             if (_panelBottom < _panelTop + 240)
             {
@@ -346,7 +347,8 @@ namespace PGvZOnlineMod.Ui
         }
 
         private int ButtonRowY => _panelBottom - BtnH - 8;
-        private int ListTopY => _panelTop + 34;
+        private int ListTopY => _panelTop + 30;
+        private int FooterY => ButtonRowY - 20;
 
         /// <summary>把真按钮摆到布局上；分辨率变了（宽屏切换）要重算一遍。</summary>
         private void ApplyLayout()
@@ -484,6 +486,8 @@ namespace PGvZOnlineMod.Ui
             _addServerBtn.mVisible = !room;
             _createBtn.mVisible = !room && !SelectedIsManual;
             _refreshBtn.mVisible = !room;
+            // 离开房间只在房间内出现：这里漏设过一次，浏览页中间就杵着一个"离开房间"
+            _disconnectBtn.mVisible = room;
 
             bool canPick = room && host && connected;
             if (!canPick)
@@ -541,9 +545,9 @@ namespace PGvZOnlineMod.Ui
                 {
                     Kind = HitKind.ServerRow,
                     X = _x0 + 10,
-                    Y = ListTopY + i * 35,
+                    Y = ListTopY + i * 34,
                     W = _leftW - 20,
-                    H = 30,
+                    H = 26,
                     Id = r.IsManual ? ManualRowId : ServerRowIdBase + i,
                     Main = Clip(r.Label, 11),
                     Right = r.Sub,
@@ -555,8 +559,8 @@ namespace PGvZOnlineMod.Ui
                     _hits.Add(new Hit
                     {
                         Kind = HitKind.Small,
-                        X = _x0 + _leftW - 32,
-                        Y = ListTopY + i * 35 + 4,
+                        X = _x0 + _leftW - 30,
+                        Y = ListTopY + i * 34 + 2,
                         W = 22,
                         H = 22,
                         Id = RemoveServerIdBase + i,
@@ -1154,8 +1158,14 @@ namespace PGvZOnlineMod.Ui
                     _rightX + 14, ListTopY + 52, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
             }
 
+            // 选中那行的副文字放在面板页脚，不挤在行与行之间
+            var sel = SelectedRow;
+            Text(g, Clip(sel.Label + " — " + sel.Sub, 24), _x0 + 8, FooterY,
+                Resources.FONT_BRIANNETOD12, new SexyColor(255, 244, 200));
+
             Text(g, "你的昵称：" + Sync.Session.LocalNick() + "（取游戏存档里的名字）",
-                _x0 + 4, _panelBottom + 34, Resources.FONT_BRIANNETOD12, new SexyColor(170, 180, 170));
+                mWidth / 2, mHeight - 22, Resources.FONT_BRIANNETOD12,
+                new SexyColor(170, 180, 170), DrawStringJustification.Center);
         }
 
         private static void Panel(Graphics g, int x, int y, int w, int h)
@@ -1288,7 +1298,10 @@ namespace PGvZOnlineMod.Ui
             }
         }
 
-        /// <summary>服务器行：参考图里是石头色按钮，这里自绘成同一种观感（贴图不能拉伸）。</summary>
+        /// <summary>
+        /// 服务器行：参考图里是石头色按钮，这里自绘成同一种观感（贴图不能拉伸）。
+        /// 副文字（地址/说明）不画在行下面——行距只有 34px，压到下一行上（实机截图踩过）。
+        /// </summary>
         private static void DrawServerRow(Graphics g, Hit h, Font font16, Font font12)
         {
             Bar(g, h,
@@ -1296,13 +1309,7 @@ namespace PGvZOnlineMod.Ui
                 h.Selected ? new SexyColor(255, 240, 170, 230) : new SexyColor(58, 60, 66, 220));
             g.SetFont(font16);
             g.SetColor(new SexyColor(28, 96, 34));
-            g.DrawString(h.Main, h.X + (h.W - (int)font16.StringWidth(h.Main)) / 2, h.Y + 7);
-            if (h.Selected && !string.IsNullOrEmpty(h.Right))
-            {
-                g.SetFont(font12);
-                g.SetColor(new SexyColor(46, 44, 44));
-                g.DrawString(Clip(h.Right, 22), h.X + 2, h.Y + h.H + 1);
-            }
+            g.DrawString(h.Main, h.X + (h.W - (int)font16.StringWidth(h.Main)) / 2, h.Y + 5);
         }
 
         private static void DrawCheckBox(Graphics g, Hit h, Font font16)

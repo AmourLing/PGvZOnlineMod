@@ -52,6 +52,7 @@ namespace PGvZOnlineVerify
             TestDiscoveryBeacon();
             TestRelayProtocol();
             TestIdentity();
+            TestDefaultRelaySeed();
             TestRelayEndToEnd();
             TestRelaySession();
             TestRelayLateReply();
@@ -1091,6 +1092,78 @@ namespace PGvZOnlineVerify
             }
             field.SetValue(null, null);
             return true;
+        }
+
+        // ------------------------------------------------------------ 5b. 默认中继的补种规则
+
+        /// <summary>
+        /// 装上就能选中作者那台中继，不必先手填；但玩家自己删空的不能又冒出来。
+        /// 区分依据是"这份文件里有没有 Servers 这一项"，不是"列表是否为空"。
+        /// </summary>
+        private static void TestDefaultRelaySeed()
+        {
+            Console.WriteLine("-- 默认中继 --");
+            string path = Path.Combine(ModEnv.DataDir, "联机配置.json");
+            byte[] backup = File.Exists(path) ? File.ReadAllBytes(path) : null;
+            try
+            {
+                Directory.CreateDirectory(ModEnv.DataDir);
+
+                File.WriteAllText(path, "{ \"HostPort\": 27150, \"SnapshotHz\": 20 }");
+                ResetCachedConfig();
+                var old = ModEnv.GetConfig();
+                Check("老配置（文件里没有 Servers 这一项）补出默认中继",
+                    old.Servers.Count == 1 && old.Servers[0].Host == ModEnv.DefaultRelayHost
+                    && old.Servers[0].Port == ModEnv.DefaultRelayPort
+                    && old.Servers[0].Name.Length > 0,
+                    "n=" + old.Servers.Count);
+                Check("补种后立刻落盘（下次读不用再补）",
+                    File.ReadAllText(path).Contains("\"Servers\""));
+
+                File.WriteAllText(path, "{ \"HostPort\": 27150, \"Servers\": [] }");
+                ResetCachedConfig();
+                var emptied = ModEnv.GetConfig();
+                Check("玩家自己删空后不再塞回默认中继", emptied.Servers.Count == 0,
+                    "n=" + emptied.Servers.Count);
+
+                string tpl = FindTemplateConfig();
+                Check("发布模板里自带这台默认中继",
+                    tpl != null && File.ReadAllText(tpl).Contains(ModEnv.DefaultRelayHost)
+                    && File.ReadAllText(tpl).Contains("\"Port\": 27270"),
+                    tpl ?? "找不到 配置模板/联机配置.json");
+            }
+            finally
+            {
+                try
+                {
+                    if (backup != null)
+                    {
+                        File.WriteAllBytes(path, backup);
+                    }
+                    else if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                    }
+                }
+                catch
+                {
+                }
+                ResetCachedConfig();
+            }
+        }
+
+        private static string FindTemplateConfig()
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            for (int up = 0; up < 6 && dir != null; up++, dir = dir.Parent)
+            {
+                string p = Path.Combine(dir.FullName, "配置模板", "联机配置.json");
+                if (File.Exists(p))
+                {
+                    return p;
+                }
+            }
+            return null;
         }
 
         // ------------------------------------------------------------ 6. 中继端到端（起真中继进程 + 真 Lidgren）
