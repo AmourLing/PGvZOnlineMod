@@ -1220,7 +1220,14 @@ namespace PGvZOnlineMod.Sync
             _relay.Poll(_relayMsgs);
             if (_relayMsgs.Count > 0)
             {
-                _relayGotReply = true;   // 收到过任何应答，就不再报"没应答"
+                // 报过"没应答"之后中继又回话了（服务器晚启动、安全组刚加上、网络抖一下）：
+                // 红字得自己收回去，否则玩家看到的是一条已经不成立的报错
+                if (_relayWarned)
+                {
+                    _relayWarned = false;
+                    SetStatus("中继 " + (_relayServed?.Name ?? "") + " 已连通", false);
+                }
+                _relayGotReply = true;
             }
             for (int i = 0; i < _relayMsgs.Count; i++)
             {
