@@ -625,6 +625,7 @@ namespace PGvZOnlineMod.Sync
             Phase = SessionPhase.Idle;
             Registry.Clear();
             _announcedIds.Clear();
+            RelayReset(); // 局内断线不走这里：隧道还承担着已连上客人的流量
             SetStatus("", false);
         }
 
@@ -915,6 +916,9 @@ namespace PGvZOnlineMod.Sync
             _now = _clock.Elapsed.TotalSeconds;
             MainThreadQueue.Pump();
             Net.Poll();
+            // 中继的收发放在 app 空判之前：它和 Net.Poll 一样只是推网络状态，
+            // 不碰 LawnApp。放后面会让离线门根本驱动不到这条路径（回归就是这么漏的）。
+            RelayTick();
 
             if (app == null)
             {
@@ -960,6 +964,284 @@ namespace PGvZOnlineMod.Sync
             }
 
             TickDiscovery();
+        }
+
+        // ============================================================ 跨互联网中继（填房间号就进）
+
+        /// <summary>
+        /// 中继只是"把两个在各自 NAT 后面的 Lidgren 端点撮合起来"，撮合完数据仍走原来的
+        /// 那 32 种消息，所以这里不新增任何游戏内协议。
+        ///
+        /// 全程主线程：控制报文与隧道都在 <see cref="Pump"/> 里非阻塞地推，
+        /// 不另起线程碰会话状态。客人侧拿到 OK 之后才真的 StartJoining，
+        /// 所以"填了房间号但中继没回"这种状态最多停在提示上，不会半连。
+        /// </summary>
+        private static RelayClient _relay;
+        private static readonly List<RelayTunnel> _tunnels = new List<RelayTunnel>();
+        private static readonly List<RelayMessage> _relayMsgs = new List<RelayMessage>();
+        private static ServerEntry _relayServed;
+        private static string _relayCode = "";
+        private static string _relayPassword = "";
+        private static bool _relayHostSide;
+        private static string _pendingJoinCode = "";
+        private static double _nextListAt;
+        private static double _nextSeenAt;
+        private static double _nextPingAt;
+
+        /// <summary>中继 LIST 回来的房间（联机页右列在"选中继"时显示的就是它）。</summary>
+        public static readonly List<RelayRoomInfo> RelayRooms = new List<RelayRoomInfo>();
+        public static long RelayRoomsVersion;
+
+        public static bool RelayHosting => _relayHostSide && _relayCode.Length > 0;
+        public static string RelayRoomCode => _relayCode;
+        public static string RelayServerName => _relayServed == null ? "" : _relayServed.Name;
+
+        /// <summary>开出来的主机侧隧道条数（离线用例用它确认"三个客人都接得住"）。</summary>
+        public static int RelayTunnelCount => _tunnels.Count;
+
+        /// <summary>联机页选中某台中继：开控制通道、探活、拉一次房间列表。传 null 表示切回局域网。</summary>
+        public static void RelaySelect(ServerEntry entry)
+        {
+            if (entry == null)
+            {
+                RelayReset();
+                return;
+            }
+            bool same = _relay != null && _relayServed != null
+                && _relayServed.Host == entry.Host && _relayServed.Port == entry.Port;
+            if (!same)
+            {
+                RelayReset();
+                _relay = new RelayClient();
+                _relayServed = entry;
+                if (!_relay.Open(entry.Host, entry.Port))
+                {
+                    SetStatus("连不上中继：" + _relay.Error, true);
+                    RelayReset();
+                    return;
+                }
+                ModEnv.Log("连接中继 " + entry.Name + " " + entry.Host + ":" + entry.Port);
+            }
+            _relay.Send(RelayProtocol.BuildPing());
+            _relay.Send(RelayProtocol.BuildList());
+            _nextListAt = _now + 2.0;
+            _nextPingAt = _now + 5.0;
+            SetStatus("正在联系中继 " + entry.Name + "…", false);
+        }
+
+        public static void RelayRefresh()
+        {
+            if (_relay == null)
+            {
+                return;
+            }
+            _relay.Send(RelayProtocol.BuildList());
+            _nextListAt = _now + 2.0;
+        }
+
+        /// <summary>
+        /// 主机侧经中继建房：局域网那套游戏服务器照旧起（隧道就接在它上面），
+        /// 然后向中继登记拿房间码，并开 MaxClients 条本地隧道。
+        /// </summary>
+        public static void StartHostingViaRelay(LawnApp app, ServerEntry entry, string password)
+        {
+            RelaySelect(entry);
+            if (_relay == null)
+            {
+                return;
+            }
+            StartHosting(app);
+            if (Phase != SessionPhase.HostingLobby)
+            {
+                return; // StartHosting 已经把失败原因写进状态了
+            }
+            _relayHostSide = true;
+            _relayPassword = RelayProtocol.Clean(password);
+            _relayCode = "";
+            _relay.Send(RelayProtocol.BuildHost(LocalNick(), _relayPassword));
+            _nextSeenAt = _now + 1.0;
+            SetStatus("正在向中继登记房间…", false);
+        }
+
+        /// <summary>客人侧：先向中继要该房间的 guestPort，OK 回来才真的连（见 RelayTick）。</summary>
+        public static void JoinViaRelay(ServerEntry entry, string code, string password)
+        {
+            code = RelayProtocol.Clean(code);
+            if (code.Length == 0)
+            {
+                SetStatus("请填写房间号", true);
+                return;
+            }
+            RelaySelect(entry);
+            if (_relay == null)
+            {
+                return;
+            }
+            _pendingJoinCode = code;
+            _relay.Send(RelayProtocol.BuildJoin(code, password));
+            SetStatus("正在加入房间 " + code + "…", false);
+        }
+
+        /// <summary>离开房间/切回局域网时收摊：关隧道、通知中继放掉房间。</summary>
+        public static void RelayReset()
+        {
+            CloseTunnels();
+            if (_relay != null)
+            {
+                if (_relayHostSide && _relayCode.Length > 0)
+                {
+                    _relay.Send(RelayProtocol.BuildDrop(_relayCode));
+                }
+                _relay.Dispose();
+            }
+            _relay = null;
+            _relayServed = null;
+            _relayCode = "";
+            _relayPassword = "";
+            _relayHostSide = false;
+            _pendingJoinCode = "";
+            if (RelayRooms.Count > 0)
+            {
+                RelayRooms.Clear();
+                RelayRoomsVersion++;
+            }
+        }
+
+        private static void CloseTunnels()
+        {
+            foreach (var t in _tunnels)
+            {
+                t.Dispose();
+            }
+            _tunnels.Clear();
+        }
+
+        /// <summary>
+        /// 每个客人一条隧道：各自绑一个本地随机端口，主机的 Lidgren 才分得清是谁。
+        /// 一条都开不出来时宁可报错也别静默少开——少开的表现是"第三个客人永远连不上"，
+        /// 比直接说"隧道开不了"难查得多。
+        /// </summary>
+        private static void OpenTunnels(int relayHostPort)
+        {
+            CloseTunnels();
+            var relayEp = new IPEndPoint(_relay.Server.Address, relayHostPort);
+            var gameEp = new IPEndPoint(IPAddress.Loopback, Net.BoundPort);
+            int failed = 0;
+            for (int slot = 0; slot < NetMgr.MaxClients; slot++)
+            {
+                var t = new RelayTunnel(slot);
+                if (t.Open(relayEp, gameEp))
+                {
+                    _tunnels.Add(t);
+                }
+                else
+                {
+                    failed++;
+                    ModEnv.Log("隧道" + slot + " 打开失败: " + t.Error);
+                }
+            }
+            if (failed > 0)
+            {
+                SetStatus("中继隧道只开出 " + _tunnels.Count + "/" + NetMgr.MaxClients
+                    + " 条，人多了会进不来", true);
+            }
+        }
+
+        private static void RelayTick()
+        {
+            if (_relay == null)
+            {
+                return;
+            }
+            for (int i = 0; i < _tunnels.Count; i++)
+            {
+                _tunnels[i].Tick(_relayCode);
+            }
+
+            if (Phase == SessionPhase.Idle && OnlineLobbyScreen.ScreenOpen && _now >= _nextListAt)
+            {
+                _nextListAt = _now + 2.0;
+                _relay.Send(RelayProtocol.BuildList());
+            }
+            if (_relayHostSide && Phase == SessionPhase.HostingLobby && _relayCode.Length > 0
+                && _now >= _nextSeenAt)
+            {
+                // 中继靠这条判断房间还活着，并把关卡/人数透给别人的列表
+                _nextSeenAt = _now + 1.0;
+                _relay.Send(RelayProtocol.BuildSeen(_relayCode, SelectedLevelIndex,
+                    LivePlayerCount(), MaxPlayers, _relayPassword));
+            }
+            if (_now >= _nextPingAt)
+            {
+                _nextPingAt = _now + 5.0;
+                _relay.Send(RelayProtocol.BuildPing());
+            }
+
+            _relayMsgs.Clear();
+            _relay.Poll(_relayMsgs);
+            for (int i = 0; i < _relayMsgs.Count; i++)
+            {
+                var m = _relayMsgs[i];
+                switch (m.Kind)
+                {
+                    case RelayKind.Rooms:
+                        RelayRooms.Clear();
+                        if (m.Rooms != null)
+                        {
+                            RelayRooms.AddRange(m.Rooms);
+                        }
+                        RelayRoomsVersion++;
+                        break;
+
+                    case RelayKind.Room:
+                        if (!_relayHostSide || m.Code.Length == 0)
+                        {
+                            break;
+                        }
+                        _relayCode = m.Code;
+                        OpenTunnels(m.HostPort);
+                        SetStatus("房间号 " + _relayCode + " —— 告诉朋友，他填这个号就能进", false);
+                        ModEnv.Log("中继登记成功 " + _relayCode + " guest=" + m.GuestPort
+                            + " host=" + m.HostPort + " 隧道=" + _tunnels.Count);
+                        break;
+
+                    case RelayKind.Ok:
+                        if (_pendingJoinCode.Length == 0 || _relayServed == null)
+                        {
+                            break;
+                        }
+                        string joined = _pendingJoinCode;
+                        _pendingJoinCode = "";
+                        ModEnv.Log("中继放行 " + joined + " → 连 " + _relayServed.Host + ":" + m.GuestPort);
+                        StartJoining(_app, _relayServed.Host, m.GuestPort);
+                        break;
+
+                    case RelayKind.Err:
+                        OnRelayError(m.Error);
+                        break;
+                }
+            }
+        }
+
+        private static void OnRelayError(string reason)
+        {
+            string why = reason switch
+            {
+                "passwd" => "房间密码不对",
+                "noready" => "没有这个房间号（对方还没建房，或房间已回收）",
+                "full" => "中继服务器房间满了",
+                "noperm" => "这个房间不是你建的，关不掉",
+                _ => "中继返回错误：" + reason,
+            };
+            ModEnv.Log("中继错误 " + reason);
+            _pendingJoinCode = "";
+            if (_relayHostSide && reason == "full")
+            {
+                _relayHostSide = false;
+                Net.Shutdown();
+                Phase = SessionPhase.Idle;
+            }
+            SetStatus(why, true);
         }
 
         // ============================================================ 暂停同步（任一方暂停=全体冻结）

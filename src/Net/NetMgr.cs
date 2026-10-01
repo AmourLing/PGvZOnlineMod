@@ -50,6 +50,13 @@ namespace PGvZOnlineMod.Net
         /// <summary>累计收到的局域网发现请求数（主机侧判断"对方到底搜没搜我"）。</summary>
         public long DiscoveryRequestsReceived { get; private set; }
 
+        /// <summary>
+        /// 主机侧：Lidgren 真正认到的连接数（不经过槽位分配，直接看传输层）。
+        /// 走中继时这是"主机能不能把三个客人当成三个人"的直接证据——
+        /// 三个客人的包若被换成同一个源端点，这里只会是 1。
+        /// </summary>
+        public int ServerConnectionCount => (_peer as NetServer)?.ConnectionsCount ?? 0;
+
         public bool IsConnected
         {
             get

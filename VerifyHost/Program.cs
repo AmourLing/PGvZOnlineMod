@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Threading;
 using Lawn;
@@ -50,6 +52,8 @@ namespace PGvZOnlineVerify
             TestDiscoveryBeacon();
             TestRelayProtocol();
             TestIdentity();
+            TestRelayEndToEnd();
+            TestRelaySession();
             TestDetour();
             Console.WriteLine($"== 结果：通过 {_passes} / 失败 {_failures} ==");
             return _failures == 0 ? 0 : 1;
@@ -1085,6 +1089,644 @@ namespace PGvZOnlineVerify
             }
             field.SetValue(null, null);
             return true;
+        }
+
+        // ------------------------------------------------------------ 6. 中继端到端（起真中继进程 + 真 Lidgren）
+
+        /// <summary>
+        /// 整套跨互联网方案的中心断言：三个客人经过同一个 guestPort 进来之后，
+        /// 主机那侧的 Lidgren 是不是还把他们当成三个人。这条不靠推理——
+        /// 起真的 PGvZRelay 进程、真的模组 NetMgr 主机与三个客户端、真的三条隧道，
+        /// 看 ServerConnectionCount 到不到 3，再各跑一发双向数据。
+        ///
+        /// 端口每次现挑：上一轮残留的僵尸中继占着控制口时，新实例会绑不上，
+        /// 而测试会对着旧进程一路绿灯（这个坑真踩过）。
+        /// </summary>
+        private static void TestRelayEndToEnd()
+        {
+            Console.WriteLine("-- 中继端到端 --");
+            string relayDll = FindRelayDll();
+            if (relayDll == null)
+            {
+                Check("中继端到端：找得到 PGvZRelay.dll", false, "先 dotnet build RelayServer -c Release");
+                return;
+            }
+
+            int relayBase = FreeUdpBlock(8);
+            int control = FreeUdpPortExcept(relayBase, 8);
+            int game = FreeUdpPortExcept(relayBase, 8);
+            Process relay = null;
+            var relayOut = new List<string>();
+            var host = new NetMgr();
+            var clients = new List<NetMgr>();
+            var tunnels = new List<PGvZOnlineMod.Net.RelayTunnel>();
+            var clientCtl = new PGvZOnlineMod.Net.RelayClient();
+            string code = null;   // finally 里要拿它发 DROP，所以声明在 try 外面
+            try
+            {
+                relay = Process.Start(new ProcessStartInfo("dotnet",
+                    "\"" + relayDll + "\" --control " + control + " --base " + relayBase
+                    + " --rooms 2 --idle 60")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                });
+                var reader = new Thread(() =>
+                {
+                    string line;
+                    while ((line = relay.StandardOutput.ReadLine()) != null)
+                    {
+                        lock (relayOut) relayOut.Add(line);
+                    }
+                }) { IsBackground = true };
+                reader.Start();
+
+                if (!clientCtl.Open("127.0.0.1", control))
+                {
+                    Check("中继端到端：控制通道可连", false, clientCtl.Error);
+                    return;
+                }
+                int guestPort = 0, hostPort = 0;
+                var got = new List<PGvZOnlineMod.Protocol.RelayMessage>();
+                var sw = Stopwatch.StartNew();
+                int nextPing = 0;
+                // 建房 + 等 ROOM 应答；PING 顺带当重试（第一个包可能丢在启动窗口里）
+                while (code == null && sw.Elapsed.TotalSeconds < 8)
+                {
+                    if (sw.ElapsedMilliseconds > nextPing)
+                    {
+                        nextPing = (int)sw.ElapsedMilliseconds + 400;
+                        clientCtl.Send(RelayProtocol.BuildHost("离线门主机", "pw1"));
+                    }
+                    got.Clear();
+                    clientCtl.Poll(got);
+                    foreach (var m in got)
+                    {
+                        if (m.Kind == RelayKind.Room)
+                        {
+                            code = m.Code;
+                            guestPort = m.GuestPort;
+                            hostPort = m.HostPort;
+                        }
+                        else if (m.Kind == RelayKind.Err)
+                        {
+                            Check("中继端到端：建房应答", false, "ERR|" + m.Error);
+                            return;
+                        }
+                    }
+                    Thread.Sleep(2);
+                }
+                Check("HOST 拿到房间码与两个端口",
+                    code != null && code.Length == 6 && guestPort == hostPort + 1,
+                    "code=" + code + " guest=" + guestPort + " host=" + hostPort);
+                if (code == null)
+                {
+                    return;
+                }
+
+                if (!host.StartHost(game))
+                {
+                    Check("中继端到端：本机游戏服务器启动", false, host.Error);
+                    return;
+                }
+                game = host.BoundPort;
+                host.OnConnected += (c, s) => host.AssignSlot(c);
+
+                var relayEp = new IPEndPoint(IPAddress.Loopback, hostPort);
+                var gameEp = new IPEndPoint(IPAddress.Loopback, game);
+                for (int slot = 0; slot < 3; slot++)
+                {
+                    var t = new PGvZOnlineMod.Net.RelayTunnel(slot);
+                    Check("隧道" + slot + " 打开", t.Open(relayEp, gameEp), t.Error);
+                    tunnels.Add(t);
+                }
+
+                for (int i = 0; i < 3; i++)
+                {
+                    var c = new NetMgr();
+                    c.OnConnected += (conn, s) => { };
+                    clients.Add(c);
+                    if (!c.StartClient("127.0.0.1", guestPort))
+                    {
+                        Check("客人" + (i + 1) + " 发起连接", false, c.Error);
+                    }
+                }
+
+                int downlinkTags = 0;
+                int upMask = 0;
+                // 每个客人各自记录"我收到过哪些回包"：只数总条数的话，
+                // 主机误用广播也照样绿，串线就查不出来了
+                var down = new int[clients.Count];
+                host.OnData = im =>
+                {
+                    int from = im.ReadInt32();
+                    upMask |= 1 << from;
+                    var ack = host.CreateMessage();
+                    ack.Write(900 + from);
+                    host.SendReliableTo(ack, im.SenderConnection);
+                };
+                for (int i = 0; i < clients.Count; i++)
+                {
+                    int me = i;
+                    clients[i].OnData += im =>
+                    {
+                        int v = im.ReadInt32();
+                        if (v >= 900 && v < 903)
+                        {
+                            down[me] |= 1 << (v - 900);
+                            Interlocked.Increment(ref downlinkTags);
+                        }
+                    };
+                }
+
+                var upSent = new bool[clients.Count];
+                bool AllDown()
+                {
+                    for (int i = 0; i < down.Length; i++)
+                    {
+                        if (down[i] != (1 << i))
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                sw.Restart();
+                while (sw.Elapsed.TotalSeconds < 12
+                    && (host.ServerConnectionCount < 3 || upMask != 0b111 || !AllDown()))
+                {
+                    foreach (var t in tunnels)
+                    {
+                        t.Tick(code);
+                    }
+                    host.Poll();
+                    for (int i = 0; i < clients.Count; i++)
+                    {
+                        var c = clients[i];
+                        c.Poll();
+                        if (!upSent[i] && c.IsConnected)
+                        {
+                            var m = c.CreateMessage();
+                            m.Write(i);
+                            c.SendReliableToHost(m);
+                            upSent[i] = true;
+                        }
+                    }
+                    got.Clear();
+                    clientCtl.Poll(got);
+                    Thread.Sleep(2);
+                }
+
+                // 这条就是整套设计的立论依据：三个客人共用一个 guestPort 进来，
+                // 主机仍要认出三个不同的端点（认成一个时这里会是 1）
+                Check("主机把三个客人认成三个连接（隧道源端口各不同）",
+                    host.ServerConnectionCount == 3, "count=" + host.ServerConnectionCount);
+                Check("三个客人各自的上行包都到了主机（没串线）",
+                    upMask == 0b111, "upMask=" + Convert.ToString(upMask, 2));
+                Check("主机的回包各归各的（点对点寻址，没有串成广播）", AllDown(),
+                    "down=" + string.Join(",", down.Select(d => Convert.ToString(d, 2))));
+
+                clientCtl.Send(RelayProtocol.BuildList());
+                bool listed = false;
+                string listedInfo = "";
+                sw.Restart();
+                while (!listed && sw.Elapsed.TotalSeconds < 4)
+                {
+                    host.Poll();
+                    foreach (var c in clients)
+                    {
+                        c.Poll();
+                    }
+                    foreach (var t in tunnels)
+                    {
+                        t.Tick(code);
+                    }
+                    got.Clear();
+                    clientCtl.Poll(got);
+                    foreach (var m in got)
+                    {
+                        if (m.Kind != RelayKind.Rooms || m.Rooms == null)
+                        {
+                            continue;
+                        }
+                        foreach (var r in m.Rooms)
+                        {
+                            if (r.Code != code)
+                            {
+                                continue;
+                            }
+                            listed = r.RoomName == "离线门主机" && r.Locked;
+                            listedInfo = r.RoomName + " locked=" + r.Locked
+                                + " players=" + r.Players + "/" + r.MaxPlayers;
+                        }
+                    }
+                    Thread.Sleep(2);
+                }
+                Check("LIST 里能看到这个房间（联机页那一行就有数据源了）", listed, listedInfo);
+
+                clientCtl.Send(RelayProtocol.BuildSeen(code, 7, 2, 4, ""));
+                Thread.Sleep(60);
+                got.Clear();
+                clientCtl.Poll(got);
+                clientCtl.Send(RelayProtocol.BuildList());
+                Thread.Sleep(120);
+                got.Clear();
+                clientCtl.Poll(got);
+                bool seenApplied = false;
+                foreach (var m in got)
+                {
+                    if (m.Kind == RelayKind.Rooms && m.Rooms != null)
+                    {
+                        foreach (var r in m.Rooms)
+                        {
+                            if (r.Code == code && r.LevelIndex == 7 && r.Players == 2)
+                            {
+                                seenApplied = true;
+                            }
+                        }
+                    }
+                }
+                Check("SEEN 上报的关卡与人数会反映到 LIST", seenApplied);
+
+                // 重复 HOST 必须复用同一个房间：应答丢一个包主机就会重发，
+                // 每次重发都新建的话几秒内就把整台服务器的房间位占满（后来的人只收到 ERR|full）
+                clientCtl.Send(RelayProtocol.BuildHost("离线门主机", "pw1"));
+                string again = null;
+                sw.Restart();
+                while (again == null && sw.Elapsed.TotalSeconds < 4)
+                {
+                    got.Clear();
+                    clientCtl.Poll(got);
+                    foreach (var m in got)
+                    {
+                        if (m.Kind == RelayKind.Room)
+                        {
+                            again = m.Code;
+                        }
+                        else if (m.Kind == RelayKind.Err)
+                        {
+                            again = "ERR|" + m.Error;
+                        }
+                    }
+                    Thread.Sleep(2);
+                }
+                Check("同一来源重复 HOST 复用原房间", again == code, "again=" + again);
+
+                // 房间码只有 6 位数字，别人猜到就能把房关掉是不行的
+                string dropReply = "无应答";
+                using (var other = new PGvZOnlineMod.Net.RelayClient())
+                {
+                    if (other.Open("127.0.0.1", control))
+                    {
+                        other.Send(RelayProtocol.BuildDrop(code));
+                        var gotOther = new List<PGvZOnlineMod.Protocol.RelayMessage>();
+                        sw.Restart();
+                        while (dropReply == "无应答" && sw.Elapsed.TotalSeconds < 3)
+                        {
+                            other.Poll(gotOther);
+                            foreach (var m in gotOther)
+                            {
+                                if (m.Kind == RelayKind.Err)
+                                {
+                                    dropReply = m.Error;
+                                }
+                            }
+                            Thread.Sleep(2);
+                        }
+                    }
+                }
+                Check("非房主的 DROP 被拒（只认建房那个端点）", dropReply == "noperm", "reply=" + dropReply);
+            }
+            catch (Exception ex)
+            {
+                Check("中继端到端全流程", false, ex.Message);
+                lock (relayOut)
+                {
+                    foreach (var l in relayOut.Take(6))
+                    {
+                        Console.WriteLine("   [relay] " + l);
+                    }
+                }
+            }
+            finally
+            {
+                try { clientCtl.Send(RelayProtocol.BuildDrop(code ?? "")); } catch { }
+                foreach (var c in clients)
+                {
+                    c.Dispose();
+                }
+                foreach (var t in tunnels)
+                {
+                    t.Dispose();
+                }
+                host.Dispose();
+                clientCtl.Dispose();
+                try
+                {
+                    if (relay != null && !relay.HasExited)
+                    {
+                        relay.Kill(true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static string FindRelayDll()
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            for (int up = 0; up < 6 && dir != null; up++, dir = dir.Parent)
+            {
+                string p = Path.Combine(dir.FullName, "RelayServer", "bin", "Release", "net6.0", "PGvZRelay.dll");
+                if (File.Exists(p))
+                {
+                    return p;
+                }
+            }
+            return null;
+        }
+
+        private static int FreeUdpPort()
+        {
+            using var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            s.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            return ((IPEndPoint)s.LocalEndPoint).Port;
+        }
+
+        /// <summary>
+        /// 连续 n 个都空闲的端口段。中继的一个房间要占相邻两个口，
+        /// 只挑一个"空闲端口"当 base 是不够的——系统连发的临时端口是挨着的，
+        /// base+1 很可能正好是本次用例自己刚用过的口（第一次端到端就是这么炸的：
+        /// 房间开不了端口 → ERR|full）。
+        /// </summary>
+        private static int FreeUdpBlock(int n)
+        {
+            for (int attempt = 0; attempt < 300; attempt++)
+            {
+                int start = 40000 + new Random().Next(0, 20000);
+                var socks = new List<Socket>();
+                bool ok = true;
+                for (int i = 0; i < n; i++)
+                {
+                    var s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                    try
+                    {
+                        s.Bind(new IPEndPoint(IPAddress.Any, start + i));
+                        socks.Add(s);
+                    }
+                    catch
+                    {
+                        ok = false;
+                        s.Dispose();
+                        break;
+                    }
+                }
+                foreach (var s in socks)
+                {
+                    s.Dispose();
+                }
+                if (ok)
+                {
+                    return start;
+                }
+            }
+            throw new InvalidOperationException("找不到连续空闲端口段");
+        }
+
+        private static int FreeUdpPortExcept(int blockStart, int blockLen)
+        {
+            for (int i = 0; i < 200; i++)
+            {
+                int p = FreeUdpPort();
+                if (p < blockStart || p >= blockStart + blockLen)
+                {
+                    return p;
+                }
+            }
+            throw new InvalidOperationException("拿不到端口段之外的空闲端口");
+        }
+
+        // ------------------------------------------------------------ 7. 会话接中继（Session 那一层 glue）
+
+        /// <summary>
+        /// 端到端用例测的是 RelayClient/RelayTunnel 两个类本身；这条测的是
+        /// Session 把它们接进会话状态机的那段 glue —— 建房拿房号、开三条隧道、
+        /// 客人经房号连上、加入别人房间时才真去 StartJoining、填错房号要给对提示、
+        /// 离开时把中继上的房间放掉。这些正是"游戏里点一下没反应"会藏的地方。
+        /// </summary>
+        private static void TestRelaySession()
+        {
+            Console.WriteLine("-- 会话接中继 --");
+            string relayDll = FindRelayDll();
+            if (relayDll == null)
+            {
+                Check("会话接中继：找得到 PGvZRelay.dll", false, "先 dotnet build RelayServer -c Release");
+                return;
+            }
+            int block = FreeUdpBlock(8);
+            int control = FreeUdpPortExcept(block, 8);
+            var relay = StartRelayProcess(relayDll, control, block);
+            var guest = new NetMgr();
+            var peerCtl = new PGvZOnlineMod.Net.RelayClient();
+            try
+            {
+                var entry = new ServerEntry { Name = "离线门中继", Host = "127.0.0.1", Port = control };
+
+                PGvZOnlineMod.Sync.Session.StartHostingViaRelay(null, entry, "pw");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.RelayRoomCode.Length == 6, 6000);
+                Check("Session 经中继建房拿到 6 位房间号",
+                    PGvZOnlineMod.Sync.Session.RelayHosting
+                    && PGvZOnlineMod.Sync.Session.RelayRoomCode.Length == 6,
+                    "code=" + PGvZOnlineMod.Sync.Session.RelayRoomCode);
+                Check("建房顺带开出三条隧道",
+                    PGvZOnlineMod.Sync.Session.RelayTunnelCount == 3,
+                    "tunnels=" + PGvZOnlineMod.Sync.Session.RelayTunnelCount);
+
+                string code = PGvZOnlineMod.Sync.Session.RelayRoomCode;
+
+                // 另一个玩家从 LIST 里看得见这个房（联机页那一行就是这条数据）
+                peerCtl.Open("127.0.0.1", control);
+                peerCtl.Send(RelayProtocol.BuildList());
+                RelayRoomInfo seen = default;
+                var msgs = new List<RelayMessage>();
+                var swl = Stopwatch.StartNew();
+                while (seen.Code == null && swl.Elapsed.TotalSeconds < 5)
+                {
+                    Thread.Sleep(30);
+                    peerCtl.Poll(msgs);
+                    foreach (var m in msgs)
+                    {
+                        if (m.Kind != RelayKind.Rooms || m.Rooms == null)
+                        {
+                            continue;
+                        }
+                        foreach (var r in m.Rooms)
+                        {
+                            if (r.Code == code)
+                            {
+                                seen = r;
+                            }
+                        }
+                    }
+                    msgs.Clear();
+                }
+                Check("别人 LIST 得到这个房（房名取存档名、标了要密码）",
+                    seen.Code == code && seen.Locked && seen.RoomName == PGvZOnlineMod.Sync.Session.LocalNick(),
+                    "seen=" + seen.Code + "/" + seen.RoomName + " locked=" + seen.Locked);
+
+                // 真客人经房间号连进来，接住它的就是 Session 自己起的隧道
+                string guestPortReply = null;
+                peerCtl.Send(RelayProtocol.BuildJoin(code, "pw"));
+                swl.Restart();
+                while (guestPortReply == null && swl.Elapsed.TotalSeconds < 5)
+                {
+                    Thread.Sleep(30);
+                    peerCtl.Poll(msgs);
+                    foreach (var m in msgs)
+                    {
+                        if (m.Kind == RelayKind.Ok)
+                        {
+                            guestPortReply = m.GuestPort.ToString();
+                        }
+                        else if (m.Kind == RelayKind.Err)
+                        {
+                            guestPortReply = "ERR|" + m.Error;
+                        }
+                    }
+                    msgs.Clear();
+                }
+                Check("客人 JOIN 正确密码换到 guestPort",
+                    guestPortReply != null && int.TryParse(guestPortReply, out int gp) && gp > 0,
+                    "reply=" + guestPortReply);
+                if (int.TryParse(guestPortReply, out int guestPort))
+                {
+                    guest.StartClient("127.0.0.1", guestPort);
+                    PumpUntil(() => PGvZOnlineMod.Sync.Session.Net.ServerConnectionCount >= 1, 8000);
+                    Check("客人经中继连上了 Session 的房（走的就是那三条隧道）",
+                        PGvZOnlineMod.Sync.Session.Net.ServerConnectionCount >= 1,
+                        "conns=" + PGvZOnlineMod.Sync.Session.Net.ServerConnectionCount);
+                }
+
+                // 离开：Session 要主动 DROP，中继上的房间不能等到超时才回收
+                int boundBefore = PGvZOnlineMod.Sync.Session.Net.BoundPort;
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                PumpUntil(() => false, 300);
+                peerCtl.Send(RelayProtocol.BuildList());
+                bool gone = false;
+                swl.Restart();
+                while (!gone && swl.Elapsed.TotalSeconds < 5)
+                {
+                    Thread.Sleep(40);
+                    peerCtl.Poll(msgs);
+                    foreach (var m in msgs)
+                    {
+                        if (m.Kind == RelayKind.Rooms && (m.Rooms == null || m.Rooms.Count == 0))
+                        {
+                            gone = true;
+                        }
+                    }
+                    msgs.Clear();
+                }
+                Check("离开房间会把中继上的房放掉（不用等空闲回收）", gone);
+                Check("离开后会话回到空闲",
+                    PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.Idle
+                    && PGvZOnlineMod.Sync.Session.RelayRoomCode.Length == 0
+                    && PGvZOnlineMod.Sync.Session.RelayTunnelCount == 0,
+                    "phase=" + PGvZOnlineMod.Sync.Session.Phase + " tunnels=" + PGvZOnlineMod.Sync.Session.RelayTunnelCount);
+                _ = boundBefore;
+
+                // 填一个不存在的房号：提示要指名道姓，不能是一句"连接失败"
+                peerCtl.Send(RelayProtocol.BuildHost("别人的房", ""));
+                string otherCode = null;
+                swl.Restart();
+                while (otherCode == null && swl.Elapsed.TotalSeconds < 5)
+                {
+                    peerCtl.Poll(msgs);
+                    foreach (var m in msgs)
+                    {
+                        if (m.Kind == RelayKind.Room)
+                        {
+                            otherCode = m.Code;
+                        }
+                    }
+                    msgs.Clear();
+                    Thread.Sleep(30);
+                }
+                PGvZOnlineMod.Sync.Session.JoinViaRelay(entry, "000000", "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.StatusText.Contains("没有这个房间号"), 4000);
+                Check("填错房号的提示说清了原因",
+                    PGvZOnlineMod.Sync.Session.StatusText.Contains("没有这个房间号"),
+                    "status=" + PGvZOnlineMod.Sync.Session.StatusText);
+
+                // 加入别人建的房：拿到 OK 之后才真的 StartJoining（会话要进 JoiningLobby）
+                PGvZOnlineMod.Sync.Session.JoinViaRelay(entry, otherCode, "");
+                PumpUntil(() => PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.JoiningLobby, 5000);
+                Check("OK 应答到达后会话才去连（进入 JoiningLobby）",
+                    PGvZOnlineMod.Sync.Session.Phase == PGvZOnlineMod.Sync.SessionPhase.JoiningLobby,
+                    "phase=" + PGvZOnlineMod.Sync.Session.Phase);
+            }
+            catch (Exception ex)
+            {
+                Check("会话接中继全流程", false, ex.Message);
+            }
+            finally
+            {
+                PGvZOnlineMod.Sync.Session.CancelOrDisconnect();
+                guest.Dispose();
+                peerCtl.Dispose();
+                try
+                {
+                    if (relay != null && !relay.HasExited)
+                    {
+                        relay.Kill(true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static Process StartRelayProcess(string dll, int control, int basePort)
+        {
+            var p = Process.Start(new ProcessStartInfo("dotnet",
+                "\"" + dll + "\" --control " + control + " --base " + basePort
+                + " --rooms 2 --idle 60")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
+            // 必须有人持续读，否则中继写满管道缓冲区后会卡住（它每收一个包就打一行）
+            new Thread(() =>
+            {
+                try
+                {
+                    while (p.StandardOutput.ReadLine() != null)
+                    {
+                    }
+                }
+                catch
+                {
+                }
+            }) { IsBackground = true }.Start();
+            return p;
+        }
+
+        /// <summary>离线驱动会话：Session.Pump(null) 会跑网络轮询与中继收发，但不碰游戏对象。</summary>
+        private static void PumpUntil(Func<bool> cond, int ms)
+        {
+            var sw = Stopwatch.StartNew();
+            while (!cond() && sw.ElapsedMilliseconds < ms)
+            {
+                PGvZOnlineMod.Sync.Session.Pump(null);
+                Thread.Sleep(5);
+            }
         }
 
         private static void TestDetour()

@@ -51,6 +51,8 @@ namespace PGvZOnlineMod.Ui
         private const int RemoveServerIdBase = 220; // 220..229 服务器行右侧的"去掉这台"
         private const int ManualRowId = 240;
         private const int PwToggleId = 241;
+        private const int CodeRowId = 242;
+        private const int RelayRoomIdBase = 250;  // 250..257 中继列表里的房间行
         internal const int TabCount = 6;            // 全部 + 五个页签（离线回归会拿它当分类数的上限校验）
         private const int RowCount = 4;             // 下拉每页显示几关
 
@@ -78,7 +80,7 @@ namespace PGvZOnlineMod.Ui
             public Core.ServerEntry Entry;
         }
 
-        private enum Dialog { None, AddServer, ManualJoin, CreateRoom }
+        private enum Dialog { None, AddServer, ManualJoin, CreateRoom, JoinRoom }
 
         private static OnlineLobbyScreen _inst;
         private static NewLawnButton _menuButton;
@@ -105,6 +107,7 @@ namespace PGvZOnlineMod.Ui
         private int _sel;                       // 左列选中行：0=局域网，1..=中继，最后一条=手动
         private bool _pwOn;
         private int _pendingLevel = -1;         // 创建房间对话框里选定、尚未开房的关卡
+        private string _joinCode = "";          // 从列表点进来的房间号（要密码时先记着）
         private bool _dropFromDialog;           // 选关下拉是从对话框里点开的
 
         private bool _dropOpen;
@@ -117,6 +120,7 @@ namespace PGvZOnlineMod.Ui
         private readonly List<Hit> _hits = new List<Hit>();
         private readonly List<ServerRow> _serverRows = new List<ServerRow>();
         private long _roomListVersion = -1;
+        private long _relayRoomsVersion = -1;
         private bool _roomPhase;
         private int _halfDeltaWidth;
         private int _halfDeltaHeight;
@@ -369,6 +373,7 @@ namespace PGvZOnlineMod.Ui
                 Dialog.AddServer => 3,
                 Dialog.ManualJoin => 2,
                 Dialog.CreateRoom => 2,
+                Dialog.JoinRoom => 2,
                 _ => 1,
             };
             dh = 70 + rows * 74 + BtnH + 30;
@@ -404,6 +409,10 @@ namespace PGvZOnlineMod.Ui
                     _addrEdit.Resize(fieldX, dy + 62, fieldW, 32);
                     _portEdit.Resize(fieldX, dy + 136, fieldW, 32);
                     break;
+                case Dialog.JoinRoom:
+                    _addrEdit.Resize(fieldX, dy + 62, fieldW, 32);   // 这里当"房间号"用
+                    _pwdEdit.Resize(fieldX, dy + 136, fieldW, 32);
+                    break;
                 case Dialog.CreateRoom:
                     _pwdEdit.Resize(fieldX, dy + 164, fieldW, 32);
                     break;
@@ -437,6 +446,23 @@ namespace PGvZOnlineMod.Ui
         private bool SelectedIsLan => _sel == 0;
         private bool SelectedIsManual => _sel > 0 && _sel >= _serverRows.Count - 1;
 
+        /// <summary>选中的是玩家自加的中继（右列这时显示 LIST 回来的房间）。</summary>
+        private bool SelectedIsRelay => !SelectedIsLan && !SelectedIsManual && SelectedRow.Entry != null;
+        private Core.ServerEntry SelectedEntry => SelectedRow.Entry;
+
+        /// <summary>换选左列：中继要开控制通道，切回局域网/手动则把中继收掉。</summary>
+        private void SelectServerRow(int i)
+        {
+            _sel = i;
+            RebuildServerRows();
+            if (i < 0 || i >= _serverRows.Count)
+            {
+                return;
+            }
+            var entry = _serverRows[i].Entry;
+            Sync.Session.RelaySelect(entry);
+        }
+
         // ------------------------------------------------------------ 状态刷新（同时重建自绘条目）
 
         private void RefreshUi()
@@ -456,9 +482,7 @@ namespace PGvZOnlineMod.Ui
 
             _backButton.mVisible = true;
             _addServerBtn.mVisible = !room;
-            // 这一批只有"局域网"这一条路真能建房/进房：选中继时把创建房间隐掉，
-            // 免得按下去悄悄开了个局域网房（面板里那行字会说明还差什么）
-            _createBtn.mVisible = !room && SelectedIsLan;
+            _createBtn.mVisible = !room && !SelectedIsManual;
             _refreshBtn.mVisible = !room;
 
             bool canPick = room && host && connected;
@@ -480,9 +504,11 @@ namespace PGvZOnlineMod.Ui
             _dlgOk.mLabel = DialogOkLabel;
             _pickLevelBtn.mVisible = _dialog == Dialog.CreateRoom;
             _nameEdit.mVisible = _dialog == Dialog.AddServer;
-            _addrEdit.mVisible = _dialog == Dialog.AddServer || _dialog == Dialog.ManualJoin;
-            _portEdit.mVisible = _addrEdit.mVisible;
-            _pwdEdit.mVisible = _dialog == Dialog.CreateRoom && _pwOn;
+            _addrEdit.mVisible = _dialog == Dialog.AddServer || _dialog == Dialog.ManualJoin
+                || _dialog == Dialog.JoinRoom;
+            _addrEdit.MaxLength = _dialog == Dialog.JoinRoom ? 6 : 40;
+            _portEdit.mVisible = _dialog == Dialog.AddServer || _dialog == Dialog.ManualJoin;
+            _pwdEdit.mVisible = (_dialog == Dialog.CreateRoom && _pwOn) || _dialog == Dialog.JoinRoom;
 
             if (dlg)
             {
@@ -539,9 +565,44 @@ namespace PGvZOnlineMod.Ui
                 }
             }
 
-            if (!SelectedIsLan)
+            if (SelectedIsManual)
             {
-                return; // 中继/手动两态没有"列表"可点：手动那行点了直接弹框
+                return; // 手动那行点了直接弹框，右列没有列表
+            }
+            if (SelectedIsRelay)
+            {
+                var rooms = Sync.Session.RelayRooms;
+                for (int i = 0; i < RoomRowMax - 1 && i < rooms.Count; i++)
+                {
+                    var r = rooms[i];
+                    string lvl = r.LevelIndex >= 0
+                        ? Sync.Session.Levels[Sync.Session.ClampLevelIndex(r.LevelIndex)].FullLabel
+                        : "还没选关";
+                    _hits.Add(new Hit
+                    {
+                        Kind = HitKind.RoomRow,
+                        X = _rightX + 10,
+                        Y = ListTopY + i * 44,
+                        W = _rightW - 20,
+                        H = 38,
+                        Id = RelayRoomIdBase + i,
+                        Main = Clip("房间：" + r.RoomName + "的房间   关卡：" + lvl + "   "
+                                   + r.Players + "/" + r.MaxPlayers + (r.Locked ? "   #密码" : ""), 28),
+                        Right = "房号 " + r.Code,
+                    });
+                }
+                // 房间号是这套方案的主入口：列表可能因为别人刚建房还没刷出来，填号总能进
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.RoomRow,
+                    X = _rightX + 10,
+                    Y = ListTopY + Math.Min(rooms.Count, RoomRowMax - 1) * 44,
+                    W = _rightW - 20,
+                    H = 38,
+                    Id = CodeRowId,
+                    Main = "用房间号加入…",
+                });
+                return;
             }
             int n = Sync.Session.RoomList.Count;
             for (int i = 0; i < RoomRowMax && i < n; i++)
@@ -634,6 +695,25 @@ namespace PGvZOnlineMod.Ui
                         Main = "踢出",
                     });
                 }
+            }
+
+            if (Sync.Session.RelayHosting)
+            {
+                // 房间号是这套流程里唯一要口头传达的东西，画在座位下面一眼能看到
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Info, X = _x0 + 120, Y = 220, W = 480, H = 18, Id = -1,
+                    Main = "房间号 " + Sync.Session.RelayRoomCode + "（经中继 "
+                           + Sync.Session.RelayServerName + "）—— 朋友在联机页选同一台中继、填这个号就能进",
+                });
+            }
+            else if (!host && Sync.Session.RelayServerName.Length > 0)
+            {
+                _hits.Add(new Hit
+                {
+                    Kind = HitKind.Info, X = _x0 + 120, Y = 220, W = 480, H = 18, Id = -1,
+                    Main = "经中继 " + Sync.Session.RelayServerName + " 连入",
+                });
             }
 
             if (host && connected)
@@ -785,6 +865,11 @@ namespace PGvZOnlineMod.Ui
                     _pwdEdit.SetText("");
                     _pwOn = false;
                     break;
+                case Dialog.JoinRoom:
+                    _addrEdit.SetText(_joinCode ?? "");
+                    _pwdEdit.SetText("");
+                    Focus(_addrEdit);
+                    break;
             }
             RefreshUi();
         }
@@ -813,6 +898,7 @@ namespace PGvZOnlineMod.Ui
             Dialog.AddServer => "添加服务器",
             Dialog.ManualJoin => "手动连接",
             Dialog.CreateRoom => "创建房间",
+            Dialog.JoinRoom => "用房间号加入",
             _ => "",
         };
 
@@ -821,6 +907,7 @@ namespace PGvZOnlineMod.Ui
             Dialog.AddServer => "添加",
             Dialog.ManualJoin => "连接",
             Dialog.CreateRoom => "创建",
+            Dialog.JoinRoom => "加入",
             _ => "确定",
         };
 
@@ -837,7 +924,23 @@ namespace PGvZOnlineMod.Ui
                 case Dialog.CreateRoom:
                     CreateRoomFromDialog();
                     break;
+                case Dialog.JoinRoom:
+                    JoinRoomFromDialog();
+                    break;
             }
+        }
+
+        private void JoinRoomFromDialog()
+        {
+            if (!SelectedIsRelay)
+            {
+                CloseDialog();
+                return;
+            }
+            string code = _addrEdit.Text.Trim();
+            _joinCode = "";
+            CloseDialog();
+            Sync.Session.JoinViaRelay(SelectedEntry, code, _pwdEdit.Text.Trim());
         }
 
         private void AddServerFromDialog()
@@ -900,7 +1003,19 @@ namespace PGvZOnlineMod.Ui
         private void CreateRoomFromDialog()
         {
             int picked = PendingOrCurrent();
+            string pwd = _pwOn ? _pwdEdit.Text.Trim() : "";
+            bool viaRelay = SelectedIsRelay;
+            var entry = SelectedEntry;
             CloseDialog();
+            if (viaRelay)
+            {
+                // 走中继时关卡由 StartHostingViaRelay 之后的 HostSetLevel 落地，
+                // 这里不能提前设——还没建房，Session 会直接 return
+                Sync.Session.StartHostingViaRelay(_app, entry, pwd);
+                Sync.Session.HostSetLevel(picked);
+                _pendingLevel = -1;
+                return;
+            }
             Sync.Session.StartHosting(_app);
             _pendingLevel = -1;
             // 建房之前 HostSetLevel 会因"还不是主机"直接返回，所以顺序必须是先建房再落地关卡
@@ -928,9 +1043,11 @@ namespace PGvZOnlineMod.Ui
                 ApplyLayout();
                 RefreshUi();
             }
-            if (_roomListVersion != Sync.Session.RoomListVersion)
+            if (_roomListVersion != Sync.Session.RoomListVersion
+                || _relayRoomsVersion != Sync.Session.RelayRoomsVersion)
             {
                 _roomListVersion = Sync.Session.RoomListVersion;
+                _relayRoomsVersion = Sync.Session.RelayRoomsVersion;
                 RefreshUi();
             }
         }
@@ -1028,9 +1145,12 @@ namespace PGvZOnlineMod.Ui
                 var r = SelectedRow;
                 Text(g, "已选中继：" + r.Label + "（" + r.Sub + "）",
                     _rightX + 14, ListTopY + 10, Resources.FONT_BRIANNETOD16, new SexyColor(255, 244, 200));
-                Text(g, "通过中继建房/找房下一批接入；现在请先选『局域网』。",
+                int rn = Sync.Session.RelayRooms.Count;
+                Text(g, rn == 0
+                    ? "这台服务器上暂时没有等待中的房间；[刷新] 再问一次，或点下面那行填房间号。"
+                    : "发现 " + rn + " 个房间（点一行加入，要密码的会问你密码）。",
                     _rightX + 14, ListTopY + 34, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
-                Text(g, "这台中继已经存进配置，选中它不会改动任何东西。",
+                Text(g, "这条不依赖同一网段：双方各自出网到这台服务器即可。",
                     _rightX + 14, ListTopY + 52, Resources.FONT_BRIANNETOD12, new SexyColor(255, 235, 200));
             }
 
@@ -1069,6 +1189,12 @@ namespace PGvZOnlineMod.Ui
                     Text(g, "对方地址（IP / 虚拟网 / 穿透地址）", dx + 24, dy + 42,
                         Resources.FONT_BRIANNETOD12, label);
                     Text(g, "端口（主机建房端口，双方要一致）", dx + 24, dy + 116,
+                        Resources.FONT_BRIANNETOD12, label);
+                    break;
+                case Dialog.JoinRoom:
+                    Text(g, "房间号（主机那台显示的 6 位数字）", dx + 24, dy + 42,
+                        Resources.FONT_BRIANNETOD12, label);
+                    Text(g, "房间密码（没设密码就留空）", dx + 24, dy + 116,
                         Resources.FONT_BRIANNETOD12, label);
                     break;
                 case Dialog.CreateRoom:
@@ -1327,7 +1453,15 @@ namespace PGvZOnlineMod.Ui
                     OpenDialog(Dialog.CreateRoom);
                     return;
                 case RefreshId:
-                    Sync.Session.RediscoverNow();
+                    // 局域网是"催一次重扫"，中继是"再问一次 LIST"
+                    if (SelectedIsRelay)
+                    {
+                        Sync.Session.RelayRefresh();
+                    }
+                    else
+                    {
+                        Sync.Session.RediscoverNow();
+                    }
                     break;
                 case DlgOkId:
                     ConfirmDialog();
@@ -1438,9 +1572,33 @@ namespace PGvZOnlineMod.Ui
                 RemoveServer(theId - RemoveServerIdBase);
                 return;
             }
+            if (theId == CodeRowId)
+            {
+                OpenDialog(Dialog.JoinRoom);
+                return;
+            }
+            if (theId >= RelayRoomIdBase && theId < RelayRoomIdBase + RoomRowMax)
+            {
+                int i = theId - RelayRoomIdBase;
+                var rooms = Sync.Session.RelayRooms;
+                if (i < rooms.Count)
+                {
+                    var r = rooms[i];
+                    if (r.Locked)
+                    {
+                        _joinCode = r.Code;   // 要密码的先问一句
+                        OpenDialog(Dialog.JoinRoom);
+                    }
+                    else
+                    {
+                        Sync.Session.JoinViaRelay(SelectedEntry, r.Code, "");
+                    }
+                }
+                return;
+            }
             if (theId >= ServerRowIdBase && theId < ServerRowIdBase + ServerRowMax)
             {
-                _sel = theId - ServerRowIdBase;
+                SelectServerRow(theId - ServerRowIdBase);
             }
         }
 

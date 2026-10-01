@@ -121,7 +121,23 @@ namespace PGvZRelay
             {
                 case RelayKind.Host:
                 {
-                    var room = CreateRoom(msg.Name, msg.Password);
+                    // 同一来源 + 同样的房名与密码才复用：应答丢包时主机必然原样重试，
+                    // 每次重试都新建的话几个来回就把整台服务器的房间位占满，
+                    // 后来的人只会收到 ERR|full（端到端用例踩到的就是这个）。
+                    // 但改了房名或密码是"我要换一个房"，不能拿旧的糊过去——
+                    // 只按来源复用会让"给房间加密码"静默失效（本地自测就是这么抓到的）。
+                    string wantName = msg.Name.Length > 0 ? msg.Name : "host";
+                    string wantPwd = RelayProtocol.Clean(msg.Password);
+                    foreach (var exist in Rooms.Values)
+                    {
+                        if (Same(exist.Owner, from) && exist.RoomName == wantName && exist.Password == wantPwd)
+                        {
+                            exist.Touch();
+                            Log($"复用 {exist.Code} 主机={exist.RoomName} guest={exist.GuestPort} host={exist.HostPort}");
+                            return RelayProtocol.BuildRoom(exist.Code, exist.GuestPort, exist.HostPort);
+                        }
+                    }
+                    var room = CreateRoom(msg.Name, msg.Password, from);
                     if (room == null)
                     {
                         Log("容量已满，拒绝建房");
@@ -160,6 +176,12 @@ namespace PGvZRelay
                 {
                     if (Rooms.TryGetValue(msg.Code, out var room))
                     {
+                        // 只认建房者：房间码是 6 位数字，任何人都能猜到并据此把别人的房关掉
+                        if (!Same(room.Owner, from))
+                        {
+                            Log($"{room.Code} 的 DROP 来自非房主 {from.Address}:{from.Port}，拒绝");
+                            return RelayProtocol.BuildError("noperm");
+                        }
                         CloseRoom(room, "主机主动关闭");
                     }
                     return "OK";
@@ -181,7 +203,7 @@ namespace PGvZRelay
             return list;
         }
 
-        private static Room CreateRoom(string hostName, string password)
+        private static Room CreateRoom(string hostName, string password, IPEndPoint owner)
         {
             lock (Gate)
             {
@@ -198,7 +220,10 @@ namespace PGvZRelay
                 while (Rooms.ContainsKey(code));
 
                 var room = new Room(code, _basePort + k * 2 + 1, _basePort + k * 2, k,
-                    string.IsNullOrEmpty(hostName) ? "host" : hostName, password);
+                    string.IsNullOrEmpty(hostName) ? "host" : hostName, password)
+                {
+                    Owner = owner,
+                };
                 if (!room.Open())
                 {
                     FreeIndex.Add(k);
@@ -222,6 +247,9 @@ namespace PGvZRelay
             room.Close();
             Log($"回收 {room.Code}（{why}）");
         }
+
+        internal static bool Same(IPEndPoint a, IPEndPoint b)
+            => a != null && b != null && a.Address.Equals(b.Address) && a.Port == b.Port;
 
         private static void ReapLoop()
         {
@@ -251,6 +279,8 @@ namespace PGvZRelay
         public int Index { get; }
         public string RoomName { get; }
         public string Password { get; }
+        /// <summary>建房者的端点：重复 HOST 复用它、DROP 也只认它。</summary>
+        public IPEndPoint Owner;
         public bool Locked => Password.Length > 0;
         public volatile bool Alive = true;
 
@@ -485,7 +515,7 @@ namespace PGvZRelay
             {
                 for (int i = 0; i < _slots.Length; i++)
                 {
-                    if (Same(_slots[i].Tunnel, ep))
+                    if (Program.Same(_slots[i].Tunnel, ep))
                     {
                         return _slots[i];
                     }
@@ -500,7 +530,7 @@ namespace PGvZRelay
             {
                 for (int i = 0; i < _slots.Length; i++)
                 {
-                    if (Same(_slots[i].Guest, ep))
+                    if (Program.Same(_slots[i].Guest, ep))
                     {
                         return _slots[i];
                     }
@@ -517,9 +547,6 @@ namespace PGvZRelay
             }
             return null;
         }
-
-        private static bool Same(IPEndPoint a, IPEndPoint b)
-            => a != null && b != null && a.Address.Equals(b.Address) && a.Port == b.Port;
 
         private static void Send(UdpClient sock, byte[] data, IPEndPoint to)
         {

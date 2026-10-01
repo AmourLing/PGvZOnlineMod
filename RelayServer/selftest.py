@@ -19,6 +19,11 @@
 端口一律每次运行现挑（空闲端口 + 连续端口段），这样上一轮没清干净的僵尸中继
 不可能被这一轮误当成被测对象——真出过一次：旧实例占着 27270，新实例控制线程炸了，
 测试却对着旧进程一路绿灯。
+
+打公网那台中继：`py -3 RelayServer/selftest.py --remote 47.116.78.238`
+不启本地中继，假游戏与三条隧道仍在 127.0.0.1，验的是"客人出网到服务器、
+服务器再回落进主机侧隧道"这条真实路径。空闲回收要等服务器自己的 60 秒，
+公网模式下跳过那一段（本地模式照样跑）。
 """
 import os
 import random
@@ -40,7 +45,17 @@ if not os.path.exists(DLL):
 
 MAX_ROOMS = 5
 IDLE = 4
-HOST = "127.0.0.1"
+LOCAL = "127.0.0.1"          # 假游戏与自己这些 socket 永远在本地
+PUBLIC_RANGE = (27200, 27229)  # 服务器上那台中继的端口段（--rooms 15 --base 27200）
+
+# --remote <ip>：打公网那台中继，不启本地进程
+REMOTE = sys.argv[sys.argv.index("--remote") + 1] if "--remote" in sys.argv else None
+HOST = REMOTE or LOCAL
+CONTROL = 27270 if REMOTE else None
+# 要往中继发包的 socket（客人、主机侧隧道）在公网模式下必须绑通配地址：
+# 绑在 127.0.0.1 上的 socket 发不出外网包，Windows 直接给 WSAENETUNREACH(10051)。
+# 假游戏仍绑 127.0.0.1——它就该只在本机。
+BIND_ANY = LOCAL if REMOTE is None else ""
 
 fails = []
 relay_log = []
@@ -60,7 +75,7 @@ def check(name, ok, detail=""):
 
 def free_port():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((HOST, 0))
+    s.bind((LOCAL, 0))
     p = s.getsockname()[1]
     s.close()
     return p
@@ -74,7 +89,7 @@ def free_block(n):
         try:
             for k in range(n):
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.bind((HOST, base + k))
+                s.bind((LOCAL, base + k))
                 socks.append(s)
         except OSError:
             for s in socks:
@@ -138,13 +153,16 @@ def tunnel(sock, code, slot, host_port, stop):
         except OSError:
             return
         if frm[1] == host_port:
-            sock.sendto(data, (HOST, GAME_PORT))     # 中继 → 游戏
+            sock.sendto(data, (LOCAL, GAME_PORT))    # 中继 → 游戏（游戏永远在本地）
         else:
-            sock.sendto(data, (HOST, host_port))     # 游戏 → 中继
+            sock.sendto(data, (HOST, host_port))     # 游戏 → 中继（公网模式下这条要穿 NAT）
 
 
 def guard(proc):
-    """中继一旦死了或日志里出现致命异常就立刻中止：后面所有断言都会变成误导。"""
+    """中继一旦死了或日志里出现致命异常就立刻中止：后面所有断言都会变成误导。
+       公网模式没有本地进程（proc is None），只查日志里带回来的错误。"""
+    if proc is None:
+        return
     rc = proc.poll()
     if rc is not None:
         raise RelayDead("进程已退出 returncode=%s" % rc)
@@ -164,18 +182,20 @@ def run(proc, ctl):
     if not ok:
         return
     code, guest_port, host_port = f[1], int(f[2]), int(f[3])
-    check("端口取自本次运行的端口段", BASE <= guest_port < BASE + MAX_ROOMS * 2
-          and guest_port == host_port + 1, "guest=%d host=%d base=%d" % (guest_port, host_port, BASE))
+    lo, hi = (PUBLIC_RANGE if REMOTE else (BASE, BASE + MAX_ROOMS * 2 - 1))
+    check("端口取自服务器自己的端口段 %d~%d" % (lo, hi),
+          lo <= guest_port <= hi and guest_port == host_port + 1,
+          "guest=%d host=%d" % (guest_port, host_port))
 
     # ---------- 假游戏 + 三条隧道 ----------
     game = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    game.bind((HOST, GAME_PORT))
+    game.bind((LOCAL, GAME_PORT))
     threading.Thread(target=fake_game, args=(game,), daemon=True).start()
 
     stops, tunnels = [], []
     for slot in range(3):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind((HOST, 0))
+        s.bind((BIND_ANY, 0))
         st = threading.Event()
         threading.Thread(target=tunnel, args=(s, code, slot, host_port, st), daemon=True).start()
         stops.append(st)
@@ -186,7 +206,7 @@ def run(proc, ctl):
     guests = []
     for i in range(3):
         g = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        g.bind((HOST, 0))
+        g.bind((BIND_ANY, 0))
         j = talk(ctl, "JOIN|%s|" % code)
         if not j.startswith("OK|"):
             check("JOIN 客人%d" % (i + 1), False, j)
@@ -244,7 +264,18 @@ def run(proc, ctl):
     game.close()
     time.sleep(0.3)
 
-    # ---------- 空闲回收 + 端口段复用 ----------
+    # ---------- 空闲回收 + 端口段复用（本地才跑：服务器自己的 idle 是 60 秒） ----------
+    if REMOTE:
+        # 公网模式不等回收，改验"主动 DROP 立刻放掉房间"——主机离开房间走的就是这条，
+        # 不生效的后果是别人 LIST 里全是不存在的空房
+        before = parse_rooms(talk(ctl, "LIST"))
+        talk(ctl, "DROP|%s|" % code)
+        time.sleep(0.3)
+        after = parse_rooms(talk(ctl, "LIST"))
+        check("公网：主动 DROP 立刻把房间放掉",
+              before and after and after["count"] < before["count"],
+              "%s → %s" % (before and before["count"], after and after["count"]))
+        return
     deadline = time.time() + IDLE + 16.0
     lst3 = None
     while time.time() < deadline:
@@ -266,22 +297,30 @@ def run(proc, ctl):
 
 def main():
     global CONTROL, BASE, GAME_PORT
-    if not os.path.exists(DLL):
-        print("找不到 PGvZRelay.dll，先 dotnet build RelayServer -c Release")
-        return 2
+    proc = None
+    BASE = 27200
+    if REMOTE:
+        CONTROL = 27270
+        GAME_PORT = free_port()
+        print("打到公网中继 %s:%d（不启本地进程；假游戏本地口=%d；空闲回收段跳过）"
+              % (HOST, CONTROL, GAME_PORT))
+    else:
+        if not os.path.exists(DLL):
+            print("找不到 PGvZRelay.dll，先 dotnet build RelayServer -c Release")
+            return 2
 
-    CONTROL = free_port()
-    BASE = free_block(MAX_ROOMS * 2)
-    GAME_PORT = free_port()
-    print("本次端口：控制=%d 端口段=%d~%d 假游戏=%d" % (CONTROL, BASE, BASE + MAX_ROOMS * 2 - 1, GAME_PORT))
+        CONTROL = free_port()
+        BASE = free_block(MAX_ROOMS * 2)
+        GAME_PORT = free_port()
+        print("本次端口：控制=%d 端口段=%d~%d 假游戏=%d" % (CONTROL, BASE, BASE + MAX_ROOMS * 2 - 1, GAME_PORT))
 
-    proc = subprocess.Popen(
-        ["dotnet", DLL, "--control", str(CONTROL), "--base", str(BASE),
-         "--rooms", str(MAX_ROOMS), "--idle", str(IDLE)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace")
-    threading.Thread(target=lambda: [relay_log.append(l.rstrip()) for l in proc.stdout],
-                     daemon=True).start()
+        proc = subprocess.Popen(
+            ["dotnet", DLL, "--control", str(CONTROL), "--base", str(BASE),
+             "--rooms", str(MAX_ROOMS), "--idle", str(IDLE)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace")
+        threading.Thread(target=lambda: [relay_log.append(l.rstrip()) for l in proc.stdout],
+                         daemon=True).start()
 
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -290,7 +329,7 @@ def main():
                 if talk(ctl, "PING") == "PONG":
                     break
             except Exception:
-                if proc.poll() is not None:
+                if proc is not None and proc.poll() is not None:
                     break
             time.sleep(0.25)
         else:
@@ -302,11 +341,12 @@ def main():
     except RelayDead as e:
         check("中继全程存活", False, str(e))
     finally:
-        proc.terminate()
-        try:
-            proc.wait(5)
-        except Exception:
-            proc.kill()
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except Exception:
+                proc.kill()
         ctl.close()
 
     print("--- 中继日志（尾部 %d 行）---" % (14 if not fails else len(relay_log)))
