@@ -995,6 +995,7 @@ namespace PGvZOnlineVerify
                 Directory.CreateDirectory(ModEnv.DataDir);
                 File.WriteAllText(path, @"
 {
+  ""DefaultRelayOffered"": true,
   ""Nickname"": ""旧字段，已从配置里删掉"",
   ""HostPort"": 99999,
   ""SnapshotHz"": 999,
@@ -1097,8 +1098,10 @@ namespace PGvZOnlineVerify
         // ------------------------------------------------------------ 5b. 默认中继的补种规则
 
         /// <summary>
-        /// 装上就能选中作者那台中继，不必先手填；但玩家自己删空的不能又冒出来。
-        /// 区分依据是"这份文件里有没有 Servers 这一项"，不是"列表是否为空"。
+        /// 装上就能选中作者那台中继，不必先手填；但玩家删掉之后不能又冒出来。
+        /// 区分靠配置里的 DefaultRelayOffered 标记，而不是"列表空不空"——
+        /// 现网那份配置就是 `"Servers": []`（第一批代码写的），按"没有 Servers 键才补"
+        /// 对它永远不生效（这条是被他自己的截图逼出来的）。
         /// </summary>
         private static void TestDefaultRelaySeed()
         {
@@ -1109,28 +1112,50 @@ namespace PGvZOnlineVerify
             {
                 Directory.CreateDirectory(ModEnv.DataDir);
 
-                File.WriteAllText(path, "{ \"HostPort\": 27150, \"SnapshotHz\": 20 }");
-                ResetCachedConfig();
-                var old = ModEnv.GetConfig();
-                Check("老配置（文件里没有 Servers 这一项）补出默认中继",
-                    old.Servers.Count == 1 && old.Servers[0].Host == ModEnv.DefaultRelayHost
-                    && old.Servers[0].Port == ModEnv.DefaultRelayPort
-                    && old.Servers[0].Name.Length > 0,
-                    "n=" + old.Servers.Count);
-                Check("补种后立刻落盘（下次读不用再补）",
-                    File.ReadAllText(path).Contains("\"Servers\""));
-
+                // 1) 现网那份：有 Servers 但是空的，且没给过默认中继
                 File.WriteAllText(path, "{ \"HostPort\": 27150, \"Servers\": [] }");
                 ResetCachedConfig();
-                var emptied = ModEnv.GetConfig();
-                Check("玩家自己删空后不再塞回默认中继", emptied.Servers.Count == 0,
-                    "n=" + emptied.Servers.Count);
+                var live = ModEnv.GetConfig();
+                Check("已存在的空列表配置补出默认中继",
+                    live.Servers.Count == 1 && live.Servers[0].Host == ModEnv.DefaultRelayHost
+                    && live.Servers[0].Port == ModEnv.DefaultRelayPort
+                    && live.Servers[0].Name.Length > 0,
+                    "n=" + live.Servers.Count);
+                // 光看"文件里有没有这个字段名"不够：序列化永远会写出它（false 也算在）。
+                // 要钉的是值真的成了 true，否则下次启动还会再补一次。
+                Check("补种后落盘并把「给过一次」写成 true",
+                    File.ReadAllText(path).Replace(" ", "").Contains("\"DefaultRelayOffered\":true"),
+                    File.ReadAllText(path).Replace("\n", " ").Trim());
 
+                // 2) 给过一次、玩家又用 × 删掉了：不能再塞回去
+                File.WriteAllText(path,
+                    "{ \"HostPort\": 27150, \"Servers\": [], \"DefaultRelayOffered\": true }");
+                ResetCachedConfig();
+                var deleted = ModEnv.GetConfig();
+                Check("删过之后不再塞回默认中继", deleted.Servers.Count == 0,
+                    "n=" + deleted.Servers.Count);
+
+                // 3) 老配置（连 Servers 这一项都没有）
+                File.WriteAllText(path, "{ \"HostPort\": 27150 }");
+                ResetCachedConfig();
+                var legacy = ModEnv.GetConfig();
+                Check("老配置（没有 Servers 键）也补出默认中继",
+                    legacy.Servers.Count == 1 && legacy.Servers[0].Host == ModEnv.DefaultRelayHost,
+                    "n=" + legacy.Servers.Count);
+
+                // 4) 发布模板自带这台、又没标记：只补标记，不重复加一条
                 string tpl = FindTemplateConfig();
-                Check("发布模板里自带这台默认中继",
-                    tpl != null && File.ReadAllText(tpl).Contains(ModEnv.DefaultRelayHost)
-                    && File.ReadAllText(tpl).Contains("\"Port\": 27270"),
+                string tplText = tpl == null ? "" : File.ReadAllText(tpl);
+                Check("发布模板自带这台默认中继与控制口",
+                    tplText.Contains(ModEnv.DefaultRelayHost) && tplText.Contains("\"Port\": 27270"),
                     tpl ?? "找不到 配置模板/联机配置.json");
+                File.WriteAllText(path, tplText);
+                ResetCachedConfig();
+                var fromTemplate = ModEnv.GetConfig();
+                Check("模板自带时不重复添加（列表里只有一条）",
+                    fromTemplate.Servers.Count == 1
+                    && fromTemplate.Servers.Count(s => s.Host == ModEnv.DefaultRelayHost) == 1,
+                    "n=" + fromTemplate.Servers.Count);
             }
             finally
             {

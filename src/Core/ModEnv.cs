@@ -41,6 +41,12 @@ namespace PGvZOnlineMod.Core
 
         /// <summary>玩家自己添加的中继服务器（联机页左列，"局域网"之外的那些）。</summary>
         public List<ServerEntry> Servers = new List<ServerEntry>();
+
+        /// <summary>
+        /// 默认中继是否已经给过一次。用这个标记而不是"列表空不空"：
+        /// 玩家用 × 删掉默认中继后，下次启动不该又冒出来（按"空就补"就会）。
+        /// </summary>
+        public bool DefaultRelayOffered;
     }
 
     /// <summary>
@@ -175,18 +181,31 @@ namespace PGvZOnlineMod.Core
             {
                 _config.ZombieHpPerExtraPlayer = 0.35f;
             }
-            // 默认中继：作者自己那台服务器，装上就能选中它跨互联网玩，不必先手填。
-            // 只在"这份配置里压根没有 Servers 这一项"时补（老配置、或首次生成的默认配置）；
-            // 有这一项但为空，是玩家自己删空的，尊重他，不再塞回去。
+            // 默认中继：作者自己那台服务器，装上就能在联机页直接选中，不必先手填。
+            // 用 DefaultRelayOffered 标记只给一次，而不是"列表空就补"——
+            // 后者会让玩家用 × 删掉它之后，下次启动又冒出来。
+            // 列表里已经有这台（发布模板自带）时也不重复加。
             bool seeded = false;
-            bool hadServersKey = raw != null && raw.Contains("\"Servers\"");
-            if (!hadServersKey && _config.Servers.Count == 0)
+            if (!_config.DefaultRelayOffered)
             {
-                _config.Servers.Add(new ServerEntry
-                {
-                    Name = DefaultRelayName, Host = DefaultRelayHost, Port = DefaultRelayPort,
-                });
+                _config.DefaultRelayOffered = true;
                 seeded = true;
+                bool has = false;
+                foreach (var s in _config.Servers)
+                {
+                    if (s != null && s.Host == DefaultRelayHost)
+                    {
+                        has = true;
+                        break;
+                    }
+                }
+                if (!has)
+                {
+                    _config.Servers.Add(new ServerEntry
+                    {
+                        Name = DefaultRelayName, Host = DefaultRelayHost, Port = DefaultRelayPort,
+                    });
+                }
             }
             if (!existed || seeded)
             {
