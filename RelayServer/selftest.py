@@ -85,15 +85,15 @@ def list_line(token=""):
     return "LIST|" + token
 
 
-def get_token(ctl):
+def get_token(ctl, port=None):
     """令牌由 PONG 发下来：拿不到就返回空串，后面的 LIST 会当场失败而不是悄悄跳过。"""
-    f = talk(ctl, PING_LINE).split("|")
+    f = talk(ctl, PING_LINE, port).split("|")
     return f[2] if len(f) >= 5 and f[0] == "PONG" else ""
 
 
-def rooms(ctl):
+def rooms(ctl, port=None):
     """先探活拿令牌再要房间表——这两步现在是绑在一起的。"""
-    return parse_rooms(talk(ctl, list_line(get_token(ctl))))
+    return parse_rooms(talk(ctl, list_line(get_token(ctl, port)), port))
 
 MAX_ROOMS = 5
 IDLE = 4
@@ -153,15 +153,54 @@ def free_block(n):
     raise RuntimeError("找不到连续空闲端口段")
 
 
-def talk(sock, msg):
-    sock.sendto(msg.encode("utf-8"), (HOST, CONTROL))
+def talk(sock, msg, port=None):
+    sock.sendto(msg.encode("utf-8"), (HOST, port or CONTROL))
     sock.settimeout(5)
     return sock.recvfrom(512)[0].decode("utf-8", "replace").strip()
 
 
-def send(sock, msg):
+def send(sock, msg, port=None):
     """只发不收：SEEN 这类报文服务端故意不应答"""
-    sock.sendto(msg.encode("utf-8"), (HOST, CONTROL))
+    sock.sendto(msg.encode("utf-8"), (HOST, port or CONTROL))
+
+
+def spawn(control, base, idle, stat, loglist, extra=()):
+    """起一台中继并把 stdout 抽进 loglist。
+       台账那段要的是"这些行确实落出来了"，所以用专用实例：--idle 给足 60 秒，
+       免得用例跑到一半房被回收；--stat 5 让心跳一行在十几秒内出现。"""
+    proc = subprocess.Popen(
+        ["dotnet", DLL, "--control", str(control), "--base", str(base),
+         "--rooms", str(MAX_ROOMS), "--idle", str(idle), "--stat", str(stat)] + list(extra),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding="utf-8", errors="replace")
+    threading.Thread(target=lambda: [loglist.append(l.rstrip()) for l in proc.stdout],
+                     daemon=True).start()
+    return proc
+
+
+def wait_ready(control, secs=20.0):
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        try:
+            if talk(socket.socket(socket.AF_INET, socket.SOCK_DGRAM), PING_LINE, control)\
+                    .split("|")[0] == "PONG":
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def wait_log(lines, pattern, secs=25.0):
+    """等一条能匹配 pattern 的日志行：日志是另一条线程落出来的，发完报文就去读会读到空的。"""
+    rx = re.compile(pattern)
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        for l in list(lines):
+            if rx.search(l):
+                return l
+        time.sleep(0.2)
+    return None
 
 
 def parse_rooms(reply):
@@ -418,6 +457,125 @@ def gates(proc, ctl):
     guard(proc)
 
 
+def ledgers():
+    """服务端日志台账：现场查"开了几把、有没有人真进来、卡在哪一道门"全靠这几行，
+       所以它和协议报文一样要有断言。公网模式读不到服务端 stdout，这段只在本机跑。"""
+    print("--- 日志台账 ---")
+    control = free_port()
+    base = free_block(MAX_ROOMS * 2)
+    log2 = []
+    proc2 = spawn(control, base, 60, 5, log2)
+    socks = []
+    try:
+        check("台账实例启动", wait_ready(control), "控制口 %d" % control)
+        c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)      # 房主的控制口
+        socks.append(c)
+        r = talk(c, host_line("台账房", ""), control)
+        f = r.split("|")
+        if len(f) != 4 or f[0] != "ROOM":
+            check("建房", False, r)
+            return
+        code, gp, hp = f[1], int(f[2]), int(f[3])
+
+        # 一条隧道登记 + 两个客人占槽：放行/峰值客人/隧道三个数各不相同，
+        # 谁被写死成一个常数都会在下面那条台账行上露馅
+        tk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tk.bind((BIND_ANY, 0))
+        socks.append(tk)
+        st = threading.Event()
+        threading.Thread(target=tunnel, args=(tk, code, 0, hp, st), daemon=True).start()
+        j = talk(c, join_line(code, ""), control)
+        if not j.startswith("OK|"):
+            check("客人 JOIN", False, j)
+            return
+        line = wait_log(log2, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} 建房 " + code +
+                        r" 主机=台账房 房主=127\.0\.0\.1:\d+ 协议=v\d+ 密码=无 "
+                        r"guest=\d+ host=\d+（当前 \d+/\d+ 房）")
+        check("建房一行带全日期、房主端点、协议与容量", line is not None,
+              "没等到这样一行" if line is None else line)
+        check("放行客人一行带来源与第几次",
+              wait_log(log2, code + r" 放行客人 127\.0\.0\.1:\d+ 协议=v\d+ 第 1 次放行（房=台账房 隧道 \d/3）") is not None)
+
+        guests = []
+        for i in range(2):
+            g = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            g.bind((BIND_ANY, 0))
+            g.sendto(b"ledger-guest-%d" % i, (HOST, gp))
+            guests.append(g)
+            socks.append(g)
+        time.sleep(0.6)
+
+        # 非房主想关别人的房：端口不同的本地 socket 就是另一个端点
+        other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        other.bind((BIND_ANY, 0))
+        socks.append(other)
+        oport = other.getsockname()[1]
+        check("非房主的 DROP 被拒", talk(other, "DROP|%s" % code, control) == "ERR|noperm")
+        check("被拒之后房还在", (rooms(c, control) or {}).get("count") == 1)
+        check("非房主 DROP 留下带端点的一行",
+              wait_log(log2, r"DROP 来自非房主 127\.0\.0\.1:" + str(oport)) is not None)
+
+        # 客人侧那些"故意不应答"的路径也要留痕，否则现场查不到
+        send(c, "SEEN|999999|1|1|1|", control)
+        check("SEEN 指向不存在的房会留一行",
+              wait_log(log2, r"SEEN 指向不存在的房 999999（房主 127\.0\.0\.1:\d+，多半已被回收）") is not None)
+        check("JOIN 不存在的房号返回 noready", talk(c, join_line("000000", "", control), control) == "ERR|noready")
+        check("JOIN 不存在的房号会留一行",
+              wait_log(log2, r"JOIN 房号 000000 不存在，拒绝 127\.0\.0\.1:\d+") is not None)
+        c.sendto("GARBAGE\x01\x02\x03\r\n伪造一行".encode("utf-8"), (HOST, control))
+        # 期望里带着"CR/LF 与不可见字符已经被剥掉"：日志行能不能被外来报文伪造，看的就是这一条
+        check("无法解析的控制报文只记一条、不回话、且被洗干净后才进日志",
+              wait_log(log2, r"无法解析的报文（127\.0\.0\.1:\d+）: \"GARBAGE伪造一行\"") is not None)
+
+        st.set()
+        talk(c, "DROP|%s" % code, control)
+        line = wait_log(log2, r"回收 " + code +
+                        r" 台账: 主机=台账房 房主=127\.0\.0\.1:\d+ 协议=v\d+ 存活=\S+ "
+                        r"放行=1 峰值客人=2/3 隧道=1/3 原因=主机主动关闭 剩余=\d+/\d+房")
+        check("回收一行是一整条台账（放行/峰值客人/隧道三个数各归各）", line is not None,
+              "没等到这样一行" if line is None else line)
+
+        # 心跳行必须真在累加，而不是把三个数写死在格式串里
+        beat = wait_log(log2, r"心跳 运行=\S+ · 在房=\d+/\d+ · 今日\(\d{2}-\d{2}\) "
+                             r"建房=1 放行=1 客人占槽=2 隧道登记=1[ ].*累计 ")
+        check("心跳一行报出运行时长与各项计数", beat is not None,
+              beat if beat else "没等到 5 秒节拍的心跳行，或那行里的计数对不上")
+
+        # 第二台：带 --inject-slot-leak，验台账不会把"没人来"这种形状当成理所当然
+        control2 = free_port()
+        base2 = free_block(MAX_ROOMS * 2)
+        log3 = []
+        proc3 = spawn(control2, base2, 60, 5, log3, ["--inject-slot-leak"])
+        try:
+            check("注入实例启动", wait_ready(control2), "控制口 %d" % control2)
+            check("注入实例在启动行里自报家门",
+                  any("自测注入" in l for l in log3), str(log3[:2]))
+            c2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            socks.append(c2)
+            f2 = talk(c2, host_line("漏槽房", ""), control2).split("|")
+            ok2 = len(f2) == 4 and f2[0] == "ROOM"
+            check("注入实例建房成功", ok2, "拿不到房号，下面那条台账断言就没法跑")
+            if ok2:
+                talk(c2, "DROP|%s" % f2[1], control2)
+                line = wait_log(log3, r"回收 " + f2[1] + r" 台账: .*放行=0 峰值客人=[1-9]/3 隧道=0/3")
+                check("有人占槽没登记隧道时，台账照实写出非零峰值", line is not None,
+                      "没等到这样一行（台账把数写死了？）" if line is None else line)
+        finally:
+            proc3.terminate()
+            try:
+                proc3.wait(5)
+            except Exception:
+                proc3.kill()
+    finally:
+        for s in socks:
+            s.close()
+        proc2.terminate()
+        try:
+            proc2.wait(5)
+        except Exception:
+            proc2.kill()
+
+
 def main():
     global CONTROL, BASE, GAME_PORT
     proc = None
@@ -437,13 +595,7 @@ def main():
         GAME_PORT = free_port()
         print("本次端口：控制=%d 端口段=%d~%d 假游戏=%d" % (CONTROL, BASE, BASE + MAX_ROOMS * 2 - 1, GAME_PORT))
 
-        proc = subprocess.Popen(
-            ["dotnet", DLL, "--control", str(CONTROL), "--base", str(BASE),
-             "--rooms", str(MAX_ROOMS), "--idle", str(IDLE)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace")
-        threading.Thread(target=lambda: [relay_log.append(l.rstrip()) for l in proc.stdout],
-                         daemon=True).start()
+        proc = spawn(CONTROL, BASE, IDLE, 300, relay_log)
 
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -467,6 +619,8 @@ def main():
 
         run(proc, ctl)
         gates(proc, ctl)
+        if not REMOTE:
+            ledgers()
     except RelayDead as e:
         check("中继全程存活", False, str(e))
     finally:

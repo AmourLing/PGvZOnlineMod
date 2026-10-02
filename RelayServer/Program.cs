@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using PGvZOnlineMod.Protocol;
 
 namespace PGvZRelay
@@ -36,6 +38,7 @@ namespace PGvZRelay
         private static int _basePort = 27200;
         private static int _maxRooms = 15;
         private static int _idleSeconds = 60;
+        private static int _statSeconds = 300;
 
         private static readonly ConcurrentDictionary<string, Room> Rooms = new();
         private static readonly ConcurrentBag<int> FreeIndex = new();
@@ -47,6 +50,47 @@ namespace PGvZRelay
 
         /// <summary>按来源地址记的房间密码错误次数（换源端口不该把计数清零）。</summary>
         private static readonly ConcurrentDictionary<string, Fails> PwFails = new();
+
+        // ------------------------------------------------------------ 统计与日志节流
+        //
+        // 这台机器唯一被问过的问题是"开了多少把"，而控制面日志当时既没有房主的来源端点、
+        // 也没有"放行过人"这一条（客人 JOIN 成功是静默的），只能靠房名反推。
+        // 所以下面这些计数器 + 每房一行的台账 + 定期心跳，全部是为了让那一问能直接 grep 出来。
+
+        internal const int SCreated = 0, SReused = 1, SPassed = 2, SGuest = 3, STunnel = 4,
+                         SRejPasswd = 5, SRejSlow = 6, SRejVersion = 7, SRejCtl = 8,
+                         SRejToken = 9, SRejFull = 10, SRejNoPerm = 11, SRejNoCode = 12,
+                         SJunk = 13, SList = 14;
+
+        internal static readonly string[] StatNames =
+        {
+            "建房", "复用", "放行", "客人占槽", "隧道登记",
+            "拒:密码", "拒:限速", "拒:版本", "拒:旧控制协议",
+            "拒:令牌", "拒:容量", "拒:非房主", "拒:无此房",
+            "垃圾包", "列表请求",
+        };
+
+        private static readonly int[] Total = new int[StatNames.Length];
+        private static readonly int[] TodayCount = new int[StatNames.Length];
+        private static DateTime _startedAt = DateTime.Now;
+        private static DateTime _dayStart = DateTime.Today;
+        private static DateTime _nextStatAt = DateTime.Now;
+
+        /// <summary>同一句话在这个窗口内只落一条：转发失败之类的能一秒刷几千条。</summary>
+        private static readonly ConcurrentDictionary<string, DateTime> LastSame = new();
+
+        /// <summary>正在收尾：收包线程被关端口抛出来的异常不该再往日志里写。</summary>
+        private static volatile bool _quitting;
+
+        /// <summary>自测专用开关：造一个"客人占了槽、主机隧道还没登记"的房间，
+        /// 用来验台账会不会照实写出非零的峰值客人。线上不带这个参数，也没有别的路径碰它。</summary>
+        internal static bool InjectSlotLeak;
+
+        internal static void Bump(int which)
+        {
+            Interlocked.Increment(ref Total[which]);
+            Interlocked.Increment(ref TodayCount[which]);
+        }
 
         private sealed class Grant
         {
@@ -64,6 +108,15 @@ namespace PGvZRelay
         {
             try { Console.OutputEncoding = Encoding.UTF8; } catch { }
 
+            // 开关参数单独一遍：下面那个值参数循环要求成对，光一个 --xxx 落在末尾会被它整个跳过
+            foreach (string a in args)
+            {
+                if (a == "--inject-slot-leak")
+                {
+                    InjectSlotLeak = true;
+                }
+            }
+
             for (int i = 0; i + 1 < args.Length; i++)
             {
                 switch (args[i])
@@ -72,6 +125,7 @@ namespace PGvZRelay
                     case "--base": _basePort = Parse(args[i + 1], _basePort); i++; break;
                     case "--rooms": _maxRooms = Parse(args[i + 1], _maxRooms); i++; break;
                     case "--idle": _idleSeconds = Parse(args[i + 1], _idleSeconds); i++; break;
+                    case "--stat": _statSeconds = Parse(args[i + 1], _statSeconds); i++; break;
                 }
             }
             for (int k = 0; k < _maxRooms; k++)
@@ -92,9 +146,13 @@ namespace PGvZRelay
                 return 1;
             }
 
+            _startedAt = DateTime.Now;
+            _nextStatAt = _startedAt.AddSeconds(_statSeconds);
+
             Log($"中继启动 控制={_controlPort} 端口段={_basePort}~{_basePort + _maxRooms * 2 - 1} " +
-                $"容量={_maxRooms}房 空闲回收={_idleSeconds}s 控制协议=v{RelayProtocol.Version} " +
-                $"令牌={RelayProtocol.TokenTtlSeconds}s 密码限速={RelayProtocol.MaxPasswdFails}次/{RelayProtocol.PasswdWindowSeconds}s");
+                $"容量={_maxRooms}房 空闲回收={_idleSeconds}s 统计行每={_statSeconds}s 控制协议=v{RelayProtocol.Version} " +
+                $"令牌={RelayProtocol.TokenTtlSeconds}s 密码限速={RelayProtocol.MaxPasswdFails}次/{RelayProtocol.PasswdWindowSeconds}s" +
+                (InjectSlotLeak ? " ⚠自测注入=占一个客人槽不登记隧道" : ""));
 
             new Thread(() => ControlLoop(control)) { IsBackground = true, Name = "control" }.Start();
             new Thread(ReapLoop) { IsBackground = true, Name = "reap" }.Start();
@@ -103,6 +161,10 @@ namespace PGvZRelay
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; quit.Set(); };
             AppDomain.CurrentDomain.ProcessExit += (s, e) => quit.Set();
             quit.Wait();
+            // 先立旗再关 socket：ControlLoop 正堵在 Receive 里，关端口必然把它抛出来。
+            // 上一版这一步抛出的异常在 catch 里又去写 Console（此时 Console 已在收尾），
+            // 于是每次 systemctl stop 都以 Unhandled exception + SIGABRT 收场，日志尾巴全废。
+            _quitting = true;
             control.Close();
             Log("退出");
             return 0;
@@ -116,16 +178,45 @@ namespace PGvZRelay
         private static void ControlLoop(UdpClient c)
         {
             IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
-            while (true)
+            while (!_quitting)
             {
+                byte[] raw;
                 try
                 {
-                    byte[] raw = c.Receive(ref from);
-                    if (raw == null || raw.Length == 0 || raw.Length > 256)
+                    raw = c.Receive(ref from);
+                }
+                catch (Exception) when (_quitting)
+                {
+                    return;     // 收尾关端口必然把 Receive 抛出来，这不是故障，别拿它污染日志尾巴
+                }
+                catch (Exception ex)
+                {
+                    LogOnce("ctl-recv", "控制通道收包异常: " + ex.Message);
+                    continue;
+                }
+                try
+                {
+                    if (raw == null || raw.Length == 0)
                     {
                         continue;
                     }
-                    var msg = RelayProtocol.Parse(Encoding.UTF8.GetString(raw));
+                    if (raw.Length > 256)
+                    {
+                        // 控制报文最长不会超过这个数：超了的就是乱发或扫描，记一笔不往下解
+                        Bump(SJunk);
+                        LogOnce("ctl-big", $"控制口收到 {raw.Length} 字节超长报文，丢弃（{from.Address}）");
+                        continue;
+                    }
+                    string text = Encoding.UTF8.GetString(raw);
+                    var msg = RelayProtocol.Parse(text);
+                    if (msg.Kind == RelayKind.Unknown)
+                    {
+                        // 陌生报文一律不回：应答比请求小，回了就只是给对方一个反射靶
+                        Bump(SJunk);
+                        LogOnce("ctl-junk", $"控制口收到无法解析的报文（{from.Address}:{from.Port}）: " +
+                            $"\"{Echo(text)}\"");
+                        continue;
+                    }
                     string reply = Handle(msg, from);
                     if (reply != null)
                     {
@@ -135,13 +226,18 @@ namespace PGvZRelay
                 }
                 catch (Exception ex)
                 {
-                    Log("控制通道异常: " + ex.Message);
+                    LogOnce("ctl-handle", "控制通道处理异常: " + ex.Message);
                 }
             }
         }
 
+        /// <summary>把外来文本压成能安全进日志的一段：Clean 去掉分隔符与控制字符（含 CR/LF，防伪造日志行）。</summary>
+        private static string Echo(string text)
+            => RelayProtocol.Clean(text ?? "");
+
         private static string Handle(RelayMessage msg, IPEndPoint from)
         {
+            string ep = Ep(from);
             switch (msg.Kind)
             {
                 case RelayKind.Host:
@@ -149,7 +245,8 @@ namespace PGvZRelay
                     // 字段布局对不上就别往下猜：旧端不带版本号，按 v2 的含义去解它的报文只会静默错乱
                     if (msg.Ctl < RelayProtocol.Version)
                     {
-                        Log($"来自 {from.Address}:{from.Port} 的 HOST 不带控制协议版本，拒绝");
+                        Bump(SRejCtl);
+                        Log($"HOST 不带控制协议版本，拒绝 {ep}");
                         return RelayProtocol.BuildError(RelayError.OldCtl);
                     }
                     // 同一来源 + 同样的房名与密码才复用：应答丢包时主机必然原样重试，
@@ -164,18 +261,23 @@ namespace PGvZRelay
                         if (Same(exist.Owner, from) && exist.RoomName == wantName && exist.Password == wantPwd)
                         {
                             exist.Touch();
-                            Log($"复用 {exist.Code} 主机={exist.RoomName} guest={exist.GuestPort} host={exist.HostPort}");
+                            Bump(SReused);
+                            Log($"复用 {exist.Code} 主机={exist.RoomName} 房主={ep} 协议=v{exist.GameVersion} " +
+                                $"guest={exist.GuestPort} host={exist.HostPort} 放行过 {exist.Joins} 次");
                             return RelayProtocol.BuildRoom(exist.Code, exist.GuestPort, exist.HostPort);
                         }
                     }
-                    var room = CreateRoom(msg.Name, msg.Password, from, msg.GameVersion);
+                    var room = CreateRoom(msg.Name, msg.Password, from, msg.GameVersion, out string fail);
                     if (room == null)
                     {
-                        Log("容量已满，拒绝建房");
+                        Bump(SRejFull);
+                        Log($"建房被拒 {ep}：{fail}");
                         return RelayProtocol.BuildError(RelayError.Full);
                     }
-                    Log($"建房 {room.Code} 主机={room.RoomName} 协议=v{room.GameVersion} guest={room.GuestPort} " +
-                        $"host={room.HostPort}（当前 {Rooms.Count} 房）");
+                    Bump(SCreated);
+                    Log($"建房 {room.Code} 主机={room.RoomName} 房主={ep} 协议=v{room.GameVersion} " +
+                        $"密码={(room.Locked ? "有" : "无")} guest={room.GuestPort} host={room.HostPort}" +
+                        $"（当前 {Rooms.Count}/{_maxRooms} 房）");
                     return RelayProtocol.BuildRoom(room.Code, room.GuestPort, room.HostPort);
                 }
                 case RelayKind.Seen:
@@ -185,17 +287,25 @@ namespace PGvZRelay
                     {
                         room.ReportSeen(msg.LevelIndex, msg.Players, msg.MaxPlayers);
                     }
+                    else
+                    {
+                        // "别人列表里看不到我的房"十有八九是这条：房主还以为房在，中继早就回收了
+                        LogOnce("seen-" + msg.Code, $"SEEN 指向不存在的房 {msg.Code}（房主 {ep}，多半已被回收）");
+                    }
                     return null;
                 }
                 case RelayKind.Join:
                 {
                     if (msg.Ctl < RelayProtocol.Version)
                     {
-                        Log($"来自 {from.Address}:{from.Port} 的 JOIN 不带控制协议版本，拒绝");
+                        Bump(SRejCtl);
+                        Log($"JOIN 不带控制协议版本，拒绝 {ep}");
                         return RelayProtocol.BuildError(RelayError.OldCtl);
                     }
                     if (!Rooms.TryGetValue(msg.Code, out var room))
                     {
+                        Bump(SRejNoCode);
+                        Log($"JOIN 房号 {msg.Code} 不存在，拒绝 {ep}");
                         return RelayProtocol.BuildError(RelayError.NoReady);
                     }
                     if (room.Locked && room.Password != RelayProtocol.Clean(msg.Password))
@@ -203,22 +313,29 @@ namespace PGvZRelay
                         if (NotePwFail(from))
                         {
                             // 房间码是 6 位数字、一次请求就能试一个，不限速的话"要密码"只是装饰
+                            Bump(SRejSlow);
                             Log($"{room.Code} 密码错误超过 {RelayProtocol.MaxPasswdFails} 次，暂时不应答 {from.Address}");
                             return RelayProtocol.BuildError(RelayError.Slow);
                         }
-                        Log($"{room.Code} 密码不对，拒绝 {from.Address}:{from.Port}");
+                        Bump(SRejPasswd);
+                        Log($"{room.Code} 密码不对，拒绝 {ep}");
                         return RelayProtocol.BuildError(RelayError.Passwd);
                     }
                     // 版本比对放在密码之后：先确认来路，再把房主的版本号透出去。
                     // 这一步拦在 Lidgren 握手之前，双方看到的会是"版本差多少"而不是干等超时。
                     if (room.GameVersion != msg.GameVersion)
                     {
+                        Bump(SRejVersion);
                         string reason = msg.GameVersion < room.GameVersion ? RelayError.Old : RelayError.New;
-                        Log($"{room.Code} 版本不匹配：客人=v{msg.GameVersion} 房主=v{room.GameVersion}");
+                        Log($"{room.Code} 版本不匹配：客人=v{msg.GameVersion} 房主=v{room.GameVersion}（{ep}）");
                         return RelayProtocol.BuildError(reason, room.GameVersion.ToString());
                     }
                     ClearPwFail(from);
                     room.Touch();
+                    room.NotePass();
+                    Bump(SPassed);
+                    Log($"{room.Code} 放行客人 {ep} 协议=v{msg.GameVersion} 第 {room.Joins} 次放行" +
+                        $"（房={room.RoomName} 隧道 {room.TunnelsReady()}/{Program.MaxSlots}）");
                     return RelayProtocol.BuildOk(room.GuestPort);
                 }
                 case RelayKind.List:
@@ -226,8 +343,11 @@ namespace PGvZRelay
                     // 令牌对不上就只回这一句：应答比请求还小，伪造源地址从这里得不到放大
                     if (!SpendToken(msg.Token, from))
                     {
+                        Bump(SRejToken);
+                        LogOnce("token", $"LIST 令牌不对，只回 ERR|token {ep}（累计拒 {Total[SRejToken]} 次）");
                         return RelayProtocol.BuildError(RelayError.Token);
                     }
+                    Bump(SList);
                     return RelayProtocol.BuildRooms(Snapshot());
                 }
                 case RelayKind.Drop:
@@ -237,10 +357,15 @@ namespace PGvZRelay
                         // 只认建房者：房间码是 6 位数字，任何人都能猜到并据此把别人的房关掉
                         if (!Same(room.Owner, from))
                         {
-                            Log($"{room.Code} 的 DROP 来自非房主 {from.Address}:{from.Port}，拒绝");
+                            Bump(SRejNoPerm);
+                            Log($"{room.Code} 的 DROP 来自非房主 {ep}，拒绝");
                             return RelayProtocol.BuildError(RelayError.NoPerm);
                         }
                         CloseRoom(room, "主机主动关闭");
+                    }
+                    else
+                    {
+                        LogOnce("drop-" + msg.Code, $"DROP 房号 {msg.Code} 不存在（{ep}）");
                     }
                     return "OK";
                 }
@@ -261,12 +386,19 @@ namespace PGvZRelay
             return list;
         }
 
-        private static Room CreateRoom(string hostName, string password, IPEndPoint owner, int gameVersion)
+        /// <summary>自测的读缝：按房号取房，用来核台账里那几个数字，不改动任何行为。</summary>
+        internal static Room FindRoom(string code) => Rooms.TryGetValue(code, out var r) ? r : null;
+
+        /// <summary>取一个空位建房。失败原因走 <paramref name="fail"/>：把"端口打不开"报成"容量已满"会指错方向。</summary>
+        private static Room CreateRoom(string hostName, string password, IPEndPoint owner, int gameVersion,
+            out string fail)
         {
+            fail = "";
             lock (Gate)
             {
                 if (!FreeIndex.TryTake(out int k))
                 {
+                    fail = $"容量已满（{Rooms.Count}/{_maxRooms} 房）";
                     return null;
                 }
                 string code;
@@ -285,9 +417,14 @@ namespace PGvZRelay
                 if (!room.Open())
                 {
                     FreeIndex.Add(k);
+                    fail = $"房位 {k} 的端口 {_basePort + k * 2 + 1}/{_basePort + k * 2} 打不开（被占用了？）";
                     return null;
                 }
                 Rooms[code] = room;
+                if (InjectSlotLeak)
+                {
+                    room.LeakSlotForTest(0);
+                }
                 return room;
             }
         }
@@ -303,11 +440,24 @@ namespace PGvZRelay
                 FreeIndex.Add(room.Index);
             }
             room.Close();
-            Log($"回收 {room.Code}（{why}）");
+            // 一行台账：以后"这几天开了多少把、有没有人真进来"只要 grep 这两个字
+            Log($"回收 {room.Code} 台账: 主机={room.RoomName} 房主={Ep(room.Owner)} 协议=v{room.GameVersion} " +
+                $"存活={Dur(room.AliveFor)} 放行={room.Joins} 峰值客人={room.PeakGuests}/{MaxSlots} " +
+                $"隧道={room.TunnelsReady()}/{MaxSlots} 原因={why} 剩余={Rooms.Count}/{_maxRooms}房");
         }
 
         internal static bool Same(IPEndPoint a, IPEndPoint b)
             => a != null && b != null && a.Address.Equals(b.Address) && a.Port == b.Port;
+
+        /// <summary>端点写成一行：日志里"哪个 IP 建的房"是这次最缺的那一格。</summary>
+        internal static string Ep(IPEndPoint ep)
+            => ep == null ? "未知" : $"{ep.Address}:{ep.Port}";
+
+        /// <summary>时长写成人能读的：36 秒 / 4分42秒 / 21小时0分。</summary>
+        internal static string Dur(TimeSpan t)
+            => t.TotalHours >= 1 ? $"{(int)t.TotalHours}小时{t.Minutes:00}分"
+             : t.TotalMinutes >= 1 ? $"{(int)t.TotalMinutes}分{t.Seconds:00}秒"
+             : $"{(int)t.TotalSeconds}秒";
 
         // ------------------------------------------------------------ 令牌与限速
 
@@ -359,7 +509,7 @@ namespace PGvZRelay
 
         private static void ReapLoop()
         {
-            while (true)
+            while (!_quitting)
             {
                 Thread.Sleep(5000);
                 foreach (var room in Rooms.Values)
@@ -386,11 +536,83 @@ namespace PGvZRelay
                         PwFails.TryRemove(kv.Key, out dropped);
                     }
                 }
+
+                // 跨天先把上一天结一行，再按 --stat 的节拍报一次"我还活着 + 现在什么样"。
+                // 24 小时开着这件事，以前只能靠"日志里最后一行的时间"反推；现在这行自己会说。
+                var now = DateTime.Now;
+                if (now.Date > _dayStart)
+                {
+                    Log($"日结 {_dayStart:yyyy-MM-dd}: " + DayText());
+                    Array.Clear(TodayCount, 0, TodayCount.Length);
+                    _dayStart = now.Date;
+                }
+                if (_statSeconds > 0 && now >= _nextStatAt)
+                {
+                    _nextStatAt = now.AddSeconds(_statSeconds);
+                    Log($"心跳 运行={Dur(now - _startedAt)} · 在房={Rooms.Count}/{_maxRooms} · " +
+                        $"今日({_dayStart:MM-dd}) {DayText()} · 累计 {DayText(Total)} · " +
+                        $"令牌表={Grants.Count} 限速表={PwFails.Count} 内存={MemoryMb()}MB");
+                }
+            }
+        }
+
+        private static string DayText() => DayText(TodayCount);
+
+        private static string DayText(int[] counts)
+        {
+            var sb = new StringBuilder();
+            for (int i = 0; i < StatNames.Length; i++)
+            {
+                if (counts[i] == 0)
+                {
+                    continue;   // 只报走过的那几条：一路全 0 才是这台机器平时该有的样子
+                }
+                if (sb.Length > 0)
+                {
+                    sb.Append(' ');
+                }
+                sb.Append(StatNames[i]).Append('=').Append(counts[i]);
+            }
+            return sb.Length > 0 ? sb.ToString() : "无";
+        }
+
+        private static string MemoryMb()
+        {
+            try
+            {
+                return (Process.GetCurrentProcess().WorkingSet64 / (1024 * 1024)).ToString();
+            }
+            catch (Exception)
+            {
+                return "?";     // 2 GiB 的机器上这一格只是好看，拿不到不该把心跳整行带走
             }
         }
 
         internal static void Log(string message)
-            => Console.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + message);
+        {
+            // 带日期：一台常年不重启的机器上，只有时分的日志分不清"昨天 20:19"和"今天 20:19"
+            try
+            {
+                Console.WriteLine(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message);
+            }
+            catch (Exception)
+            {
+                // 收尾阶段 Console 可能已经不可写；日志写不出去绝不能变成一次 SIGABRT
+            }
+        }
+
+        /// <summary>同一个 key 每 60 秒最多落一条：转发失败这种能一秒刷几千条的必须限流。</summary>
+        internal static void LogOnce(string key, string message)
+        {
+            var now = DateTime.Now;
+            var last = LastSame.GetOrAdd(key, DateTime.MinValue);
+            if ((now - last).TotalSeconds < 60)
+            {
+                return;
+            }
+            LastSame[key] = now;
+            Log(message);
+        }
     }
 
     /// <summary>一个房间：两个端口 + 三个槽位（槽位 = 一个客人 ↔ 主机侧一条隧道）。</summary>
@@ -408,10 +630,67 @@ namespace PGvZRelay
         public IPEndPoint Owner;
         public bool Locked => Password.Length > 0;
         public volatile bool Alive = true;
+        /// <summary>建房那一刻：台账里的"存活多久"以它为起点，而不是最后一次活动。</summary>
+        public readonly DateTime CreatedAt = DateTime.Now;
+        /// <summary>控制面放行过几次 JOIN（同一台机器重连会算两次，所以它与"峰值客人"是两个数）。</summary>
+        public int Joins;
+
+        public TimeSpan AliveFor => DateTime.Now - CreatedAt;
+
+        public void NotePass() => Interlocked.Increment(ref Joins);
+
+        /// <summary>当前占了几个客人槽（0..MaxSlots）。</summary>
+        public int PeakGuests
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    int n = 0;
+                    for (int i = 0; i < _slots.Length; i++)
+                    {
+                        if (_slots[i].Guest != null)
+                        {
+                            n++;
+                        }
+                    }
+                    return n;
+                }
+            }
+        }
+
+        public int TunnelsReady()
+        {
+            lock (_sync)
+            {
+                int n = 0;
+                for (int i = 0; i < _slots.Length; i++)
+                {
+                    if (_slots[i].TunnelReady)
+                    {
+                        n++;
+                    }
+                }
+                return n;
+            }
+        }
 
         private readonly UdpClient _hostSock = new();
         private readonly UdpClient _guestSock = new();
         private readonly Slot[] _slots = new Slot[Program.MaxSlots];
+
+        /// <summary>自测的造数缝：源端口 0 在任何真实报文里都出现不了，所以这个端点只会被台账数到，
+        /// 永远不会被 SlotByGuest 当成某个真实客人匹配上，转发行为不受影响。</summary>
+        internal static readonly IPEndPoint LeakMark = new IPEndPoint(IPAddress.Loopback, 0);
+
+        /// <summary>自测用：把第 i 个槽记成"有客人"，但不登记主机侧隧道。</summary>
+        internal void LeakSlotForTest(int i)
+        {
+            lock (_sync)
+            {
+                _slots[i].Guest = LeakMark;
+            }
+        }
         private readonly object _sync = new();
         private DateTime _last = DateTime.Now;
         private int _levelIndex = -1;
@@ -524,7 +803,7 @@ namespace PGvZRelay
                 }
                 catch (Exception ex)
                 {
-                    Program.Log($"[{Code}] 主机侧收包异常: {ex.Message}");
+                    Program.LogOnce($"room-{Code}-h", $"[{Code}] 主机侧收包异常: {ex.Message}");
                     continue;
                 }
                 if (data == null || data.Length == 0 || data.Length > Program.MaxPacket)
@@ -565,7 +844,7 @@ namespace PGvZRelay
                 }
                 catch (Exception ex)
                 {
-                    Program.Log($"[{Code}] 客人侧收包异常: {ex.Message}");
+                    Program.LogOnce($"room-{Code}-g", $"[{Code}] 客人侧收包异常: {ex.Message}");
                     continue;
                 }
                 if (data == null || data.Length == 0 || data.Length > Program.MaxPacket)
@@ -577,7 +856,11 @@ namespace PGvZRelay
                 var slot = SlotByGuest(src);
                 if (slot == null)
                 {
-                    continue; // 房间满：客人自己会收到超时，主机侧也会显示掉线
+                    // 房间满：客人自己会收到超时，主机侧也会显示掉线。服务端必须留下这条，
+                    // 否则"他为什么进不来"在现场是查不出来的
+                    Program.LogOnce($"room-{Code}-full",
+                        $"[{Code}] 客人槽已满 {Program.MaxSlots} 个，丢弃来自 {Program.Ep(src)} 的包");
+                    continue;
                 }
                 if (!slot.TunnelReady)
                 {
@@ -628,7 +911,8 @@ namespace PGvZRelay
             }
             if (first)
             {
-                Program.Log($"[{Code}] 槽位{i} 隧道登记 {src.Address}:{src.Port}");
+                Program.Bump(Program.STunnel);
+                Program.Log($"[{Code}] 槽位{i} 隧道登记 {Program.Ep(src)}");
             }
             if (pending != null)
             {
@@ -667,6 +951,7 @@ namespace PGvZRelay
                     if (_slots[i].Guest == null)
                     {
                         _slots[i].Guest = ep;
+                        Program.Bump(Program.SGuest);
                         Program.Log($"[{Code}] 槽位{i} 客人接入 {ep.Address}:{ep.Port}");
                         return _slots[i];
                     }
@@ -687,7 +972,7 @@ namespace PGvZRelay
             }
             catch (Exception ex)
             {
-                Program.Log("转发失败: " + ex.Message);
+                Program.LogOnce("fwd", "转发失败 → " + Program.Ep(to) + ": " + ex.Message);
             }
         }
 
